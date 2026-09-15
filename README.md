@@ -55,6 +55,36 @@ Then open:
 - <http://127.0.0.1:8000/> — a one-page chat UI
 - <http://127.0.0.1:8000/docs> — Swagger
 
+## Deploy
+
+The app runs on Vercel as a single Python function. Three things make that work,
+and each is a consequence of how serverless hosting differs from a laptop:
+
+- **`app.py`** at the repo root. Vercel loads a `FastAPI` instance named `app`
+  from a fixed set of filenames; the real application lives in a package, so
+  this file is the bridge.
+- **`DB_PATH=/tmp/app.db`** (set in `vercel.json`). The filesystem is read-only
+  apart from `/tmp`, so the default `data/app.db` cannot be written.
+- **`data/snapshot.db.gz`**, a pre-ingested database of ~110 large caps, one
+  year each. `/tmp` is per-instance and wiped on a cold start, so without a
+  seed the first visitor would meet an empty page; `stock_moves.seed` expands
+  the snapshot when no database is present. Rebuild it with
+  `uv run python scripts/build_snapshot.py`.
+
+```bash
+vercel deploy          # preview
+vercel deploy --prod   # production
+```
+
+An `ANTHROPIC_API_KEY` set in the Vercel project's environment variables
+upgrades scoring, prose and chat exactly as it does locally; the committed
+snapshot keeps whichever provider wrote each stored explanation.
+
+Two properties of the deployment worth stating plainly, because they are
+limits and not surprises: `/tmp` is not shared between instances, so an ingest
+one visitor triggers is not visible to another, and the snapshot's data ages
+until the next rebuild — a request for a stale ticker re-ingests it live.
+
 ## API, by example
 
 Ingest a year of prices, detect the moves, fetch and score news, and explain

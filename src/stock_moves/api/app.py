@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 
 from stock_moves.api import chat, tickers
 from stock_moves.db import init_db
+from stock_moves.seed import ensure_seeded
 from stock_moves.settings import Settings, get_settings
 
 __all__ = ["STATIC_DIR", "app", "create_app"]
@@ -54,7 +55,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        """Create any missing tables before the first request is served."""
+        """Seed from the snapshot if there is no database, then create any
+        missing tables, before the first request is served."""
+        ensure_seeded()
         init_db()
         yield
 

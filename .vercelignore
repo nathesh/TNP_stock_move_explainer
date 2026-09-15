@@ -1,0 +1,14 @@
+# What never needs to reach a build. The CLI uploads the working directory as
+# it stands, so the local virtualenv (185 MB) and the uncompressed snapshot
+# (17 MB, rebuilt from the .gz) would otherwise be sent on every deploy.
+.venv
+data/*.db
+data/*.db-journal
+.pytest_cache
+.ruff_cache
+__pycache__
+*.pyc
+.env
+.env.*
+tests
+docs

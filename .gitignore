@@ -15,3 +15,5 @@ wheels/
 # Local SQLite databases (data/.gitkeep is tracked)
 data/*.db
 data/*.db-journal
+.vercel
+.env*

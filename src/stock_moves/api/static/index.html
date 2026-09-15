@@ -73,7 +73,6 @@
     border-radius: 8px;
     padding: 9px 10px;
   }
-  #ticker { text-transform: uppercase; max-width: 8.5rem; }
   textarea { resize: vertical; min-height: 68px; }
   button {
     background: var(--accent);
@@ -100,15 +99,11 @@
   <div id="transcript" aria-live="polite"></div>
 
   <form id="composer" autocomplete="off">
-    <div class="row">
-      <input id="ticker" type="text" placeholder="TICKER" aria-label="Ticker (optional)" />
-      <input id="session" type="text" readonly tabindex="-1" placeholder="session id" aria-label="Session id" />
-    </div>
-    <textarea id="message" placeholder="Why did NVDA drop on 2025-01-27?" aria-label="Message"></textarea>
+    <textarea id="message" placeholder="Why did NVDA drop on 2026-01-20?" aria-label="Message"></textarea>
     <div class="row">
       <button id="send" type="submit">Send</button>
     </div>
-    <p class="hint">Enter sends, Shift+Enter adds a newline. Ticker is optional.</p>
+    <p class="hint">Enter sends, Shift+Enter adds a newline. Name the ticker in the question.</p>
   </form>
 </div>
 
@@ -119,9 +114,9 @@
   var transcript = document.getElementById("transcript");
   var form = document.getElementById("composer");
   var messageBox = document.getElementById("message");
-  var tickerBox = document.getElementById("ticker");
-  var sessionBox = document.getElementById("session");
   var sendButton = document.getElementById("send");
+  // Kept across turns so the server can read the transcript back, but never
+  // shown or typed: one question in the box is the whole interface.
   var sessionId = null;
   var busy = false;
 
@@ -172,8 +167,6 @@
     if (!message || busy) {
       return;
     }
-    var ticker = tickerBox.value.trim().toUpperCase();
-
     addTurn("user", message);
     messageBox.value = "";
     setBusy(true);
@@ -185,7 +178,6 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           message: message,
-          ticker: ticker || null,
           session_id: sessionId
         })
       });
@@ -195,7 +187,6 @@
       }
       if (body.session_id) {
         sessionId = body.session_id;
-        sessionBox.value = sessionId;
       }
       pending.querySelector(".bubble").textContent = body.reply || "(no reply)";
       addToolCalls(pending, body.tool_calls);
