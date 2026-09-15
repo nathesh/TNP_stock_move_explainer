@@ -1,16 +1,27 @@
 [project]
-name = "tetrix-take-home"
+name = "stock-move-explainer"
 version = "0.1.0"
-description = "Add your description here"
+description = "Explains major stock price moves using news, decomposition and a language model"
 readme = "README.md"
 authors = [
     { name = "nathesh", email = "thejchess@gmail.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "anthropic>=1.6.0",
+    "fastapi>=0.141.1",
+    "httpx>=0.28.1",
+    "numpy>=2.5.3",
+    "pandas>=3.0.5",
+    "pydantic>=2.13.5",
+    "python-dotenv>=1.2.3",
+    "sqlmodel>=0.0.42",
+    "uvicorn[standard]>=0.53.0",
+    "yfinance>=1.7.0",
+]
 
 [project.scripts]
-tetrix-take-home = "tetrix_take_home:main"
+stock-moves = "stock_moves:main"
 
 [build-system]
 requires = ["uv_build>=0.11.16,<0.12.0"]
@@ -21,3 +32,6 @@ dev = [
     "pytest>=9.1.1",
     "ruff>=0.16.7",
 ]
+
+[tool.uv.build-backend]
+module-name = "stock_moves"

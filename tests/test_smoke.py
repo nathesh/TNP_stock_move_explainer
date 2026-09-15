@@ -1,5 +1,5 @@
-import tetrix_take_home
+import stock_moves
 
 
 def test_imports():
-    assert tetrix_take_home is not None
+    assert stock_moves is not None

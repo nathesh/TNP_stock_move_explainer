@@ -1,0 +1,144 @@
+# Design: explaining major stock moves with news
+
+Take-home, 4-hour window, Python. Decisions below are the source of truth for
+`docs/architecture-v1.md`, `docs/architecture-v2.md`, and `docs/v1-plan.md`.
+
+## 0. Framing
+
+**The "why" is attribution, not causation.** One event day and a bag of articles
+is not an identifiable causal problem. The system does two things:
+
+1. A **quantitative decomposition** of each move that says *where* to look
+   (company / industry / macro) before any article is read.
+2. **Grounded retrieval + a language model** that writes the explanation with
+   citations and a confidence, and is explicitly allowed to return
+   `unexplained` when the evidence is weak.
+
+v1 is a local prototype on free, keyless data. Every external dependency sits
+behind an interface so v2 can swap in paid news, our own classifiers, and AWS.
+
+## 1. Prices and move detection
+
+Source: `yfinance` daily OHLCV for the ticker, `SPY`, and the sector ETF
+(sector from `yfinance` `info`, mapped to XLK/XLF/XLE/... via a static dict).
+
+Per trading day we compute and **store as columns** (thresholds are API
+filters, not code constants):
+
+| column | meaning |
+|---|---|
+| `ret` | close-to-close daily return |
+| `ret_z` | `ret` / trailing 20-day std of `ret` (the primary "major" definition, flag at abs >= 2.0) |
+| `gap_ret`, `intraday_ret` | prev close→open, open→close (overnight news vs in-session news) |
+| `vol_z` | volume / trailing 20-day mean volume |
+| `mkt_component`, `sector_component`, `idio_component` | from a trailing 60-day OLS of stock on SPY and sector ETF; `idio = ret - beta_mkt*ret_spy - beta_sec*ret_etf` |
+| `routing` | `company` if abs(idio) dominates, `industry` if sector dominates, `macro` if market dominates |
+| `regime_mkt`, `regime_sector` | `bull`/`bear` from 50 vs 200 day SMA of SPY / sector ETF on that date |
+| `near_earnings` | true if within ±1 trading day of a `yfinance` earnings date |
+
+A **move** is a day with `abs(ret_z) >= z_threshold` (default 2.0) OR
+`abs(ret) >= pct_threshold` (default 0.02, kept configurable because the prompt
+suggests it; z is the real definition). Both thresholds are query params.
+
+Move detection is a pure function over a DataFrame → unit-testable with no
+network.
+
+## 2. Company ontology (seed of the v2 knowledge graph)
+
+Table `companies(ticker, name, sector, industry, sector_etf, peers_json,
+updated_at)`. Name/sector/industry from `yfinance`; `peers` from one cached LLM
+call (fallback: empty list). Peers give a **second, data-driven industry
+signal**: same-day co-movement of peer prices. If AMD and NVDA both fell 5%, the
+move is industry before any article is read.
+
+## 3. News
+
+Probed 2026-09-15 with no keys: **Google News RSS** returns 100 dated,
+sourced items per query with `after:`/`before:` operators and no throttle;
+**GDELT DOC 2.0** works but enforces one request per five seconds; yfinance
+`news` is recent-only. So:
+
+- `NewsSource` protocol: `search(query: str, start: date, end: date, limit: int) -> list[Article]`.
+- **`GoogleNewsRSS` is the v1 primary** (keyless, historical, mainstream outlets;
+  cost: title/source/url/date only, no body, and a Google redirect URL).
+- **`GDELTSource` is the second implementation**, behind a 5-second client-side
+  throttle, used as a fallback or when `NEWS_SOURCE=gdelt`.
+- Queries are built per routing bucket, and always anchored to the market so
+  a bare company name does not return obituaries:
+  - `company` → `"<company name>" stock` (plus ticker) in a ±1 day window
+  - `industry` → company name OR peer names OR industry term, same window
+  - `macro` → fixed macro vocabulary (Federal Reserve, CPI, tariff, ...) same window
+
+Plus **earnings dates from `yfinance`** as a structured, keyless event source.
+Twitter / executive commentary: out of v1 (no API path in 4h), listed in v2.
+v2 adds a paid full-text source (Exa) behind the same protocol.
+
+Articles are deduped on URL, stored once, and linked to moves through
+`move_articles(move_id, article_id, relevance, category)`.
+
+## 4. Scoring and explanation (the model layer)
+
+`ModelProvider` interface with two implementations:
+
+- `AnthropicProvider` (used when `ANTHROPIC_API_KEY` is set): scores each
+  article (relevance 0–1, category company/industry/macro) and writes the
+  per-move explanation.
+- `HeuristicProvider` (no key): keyword rules + the decomposition. Relevance =
+  name/peer/macro-term hits; category = routing bucket; explanation = a
+  templated sentence from the numbers. **The app runs with zero keys.**
+
+Explanation input: decomposition numbers, regime, earnings proximity, peer
+co-movement, top-K scored articles. Output is structured:
+
+```json
+{"summary": "...", "primary_category": "company|industry|macro|unexplained",
+ "confidence": 0.0-1.0, "cited_article_ids": [...], "unexplained": false}
+```
+
+Cached per move in `explanations`. Explanations are computed for the top-N
+moves by `abs(ret_z)` on ingest (default N=10) and on demand for any other move
+— this is the cost/time control.
+
+v2: the provider is replaced by our own fine-tuned relevance/category
+classifier trained on the accumulated `move_articles` labels; the LLM stays only
+for the prose.
+
+## 5. Storage
+
+**SQLite via SQLModel** (`data/app.db`). No vector DB in v1: the join between
+moves and news is a **date window**, not semantics.
+
+Tables: `companies`, `prices`, `moves`, `articles`, `move_articles`,
+`explanations`, `chat_messages`.
+
+**Lazy population**: first `GET /tickers/{t}` ingests and caches; later GETs
+read; `?refresh=true` re-ingests. Ingest is idempotent on `(ticker, date)`.
+
+## 6. API (FastAPI)
+
+- `POST /tickers/{ticker}/ingest?period=1y&top_n=10` — explicit ingest.
+- `GET /tickers/{ticker}` — prices + moves + linked news + explanations.
+  Filters: `start`, `end`, `z_threshold`, `pct_threshold`, `direction`
+  (`up|down`), `category`, `min_relevance`, `include_prices`, `include_news`,
+  `limit`.
+- `GET /tickers/{ticker}/moves/{date}` — one move with everything attached;
+  computes the explanation on demand if missing.
+- `POST /chat` — `{ "message", "ticker"?, "session_id"? }` → `{ "reply",
+  "session_id", "tool_calls" }`. Plain JSON, no SSE. A tool-calling loop whose
+  tools are the read functions above (`list_moves`, `get_move`, `search_news`).
+  With no key, the heuristic provider answers from the same tools with a
+  templated reply.
+- `GET /` — a single static HTML chat page (fetch → `/chat`), plus Swagger at
+  `/docs`. No JS framework.
+
+## 7. Out of scope for v1 (named in v2)
+
+Paid news APIs with full text; semantic dedupe (pgvector); scheduled
+incremental ingest; multi-day move windows; executive/social commentary;
+confidence calibration against a labeled move set; deployment (v1 runs
+locally; Vercel would need the DB off disk).
+
+## 8. Naming
+
+The public repo and package must not contain the company name. Repo:
+`stock-move-explainer`; package: `stock_moves`.

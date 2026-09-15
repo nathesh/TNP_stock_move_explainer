@@ -1,4 +1,4 @@
-# Tetrix take-home
+# stock-move-explainer
 
 Time-boxed take-home, 2026-09-15.
 
