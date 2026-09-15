@@ -2,7 +2,7 @@
 
 ## What changes and what does not
 
-The core pipeline and the API contract stay the same: prices → move detection → decomposition and routing → news fetch → scoring → explanation, exposed as `GET /tickers/{ticker}`, `GET /tickers/{ticker}/moves/{date}`, `POST /chat`, and the same JSON shapes. `ModelProvider` stays as the seam. What changes is everything around that seam. Ingest moves from lazy-on-request to scheduled and incremental, with a queue between fetch and scoring. SQLite becomes RDS Postgres with pgvector, and raw article bodies go to S3. A paid full-text provider (Exa) becomes the primary `NewsSource` implementation; `GoogleNewsRSS` and `GDELTSource` stay behind the same protocol as fallbacks. The LLM stops scoring articles; a fine-tuned relevance and category classifier, trained on the labels v1 accumulated in `move_articles`, does that, and the LLM writes only the prose. The company ontology becomes a knowledge graph, in Postgres first. Keys live in Secrets Manager, logs and metrics in CloudWatch, and the chat page is a small static UI on S3 + CloudFront.
+The core pipeline and the API contract stay the same: prices → move detection → decomposition and routing → news fetch → scoring → explanation, exposed as `GET /tickers/{ticker}`, `GET /tickers/{ticker}/moves/{date}`, `POST /chat`, and the same JSON shapes. `ModelProvider` stays as the seam. What changes is everything around that seam. Ingest moves from lazy-on-request to scheduled and incremental, with a queue between fetch and scoring. SQLite becomes RDS Postgres with pgvector, and raw article bodies go to S3. A paid full-text provider (Exa) becomes the primary `NewsSource` implementation; `GoogleNewsRSS` and `GDELTSource` stay behind the same protocol as fallbacks. The LLM stops scoring articles. FinBERT, a finance-tuned BERT, becomes the local scorer first (sentiment and event type out of the box, served as a small service), and is then fine-tuned on the labels v1 accumulated in `move_articles` into our own relevance and category classifier; the LLM writes only the prose. The company ontology becomes a knowledge graph, in Postgres first. Keys live in Secrets Manager, logs and metrics in CloudWatch, and the chat page is a small static UI on S3 + CloudFront.
 
 ## Component diagram
 
@@ -30,7 +30,7 @@ flowchart TB
   end
 
   subgraph model["Model layer"]
-    CLF["Relevance and category classifier: SageMaker endpoint or Fargate service"]
+    CLF["FinBERT, then fine-tuned relevance and category classifier: SageMaker endpoint or Fargate service"]
     LLM["LLM for prose only: Bedrock or Anthropic API"]
   end
 
@@ -126,6 +126,7 @@ Every row v1 writes to `move_articles` is a weak label: `(move context, article)
 
 | step | what | why |
 |---|---|---|
+| 0 | Serve FinBERT as-is behind `ClassifierProvider` for sentiment and event type; the v1 heuristic becomes the fallback | A finance-tuned encoder beats keyword rules on day one, before any of our own labels exist |
 | 1 | Export `move_articles` joined to `moves` (routing, ret_z, near_earnings, peer_comove) and `articles` (title, source, and body once available) | The classifier input is the pair, not the article alone |
 | 2 | Keep only rows scored by `AnthropicProvider`; drop heuristic rows or mark them as a separate weak source | Heuristic labels are keyword hits and would teach the model to count keywords |
 | 3 | Hand-label a stratified sample: ~300 pairs across category, relevance bucket, and ticker | Measures LLM label noise and gives a gold eval set |
