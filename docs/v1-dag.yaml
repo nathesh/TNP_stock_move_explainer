@@ -999,6 +999,13 @@ tasks:
       End with a "Known limitations" list of at most 8 bullets taken from docs/architecture-v1.md.
 
       --- QUESTIONS ---
+      1. Briefly describe your process for completing the project from start to finish. Include details on
+         assumptions made and key decisions taken / tradeoffs made for each step (if relevant).
+      2. Are you happy with your solution? Why or why not?
+      3. What would you do differently if you got to do this over again?
+      4. Did you get stuck anywhere? How'd you get unstuck?
+      (These four, verbatim from the assignment email, are the headings. Brief answers only: the email
+      says the write-up should take about 10 minutes.)
 
       ACCEPTANCE: file exists, under 120 lines, every heading is a question, no claim contradicts README or
       the T15 report.
