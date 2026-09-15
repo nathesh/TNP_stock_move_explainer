@@ -27,7 +27,7 @@ flowchart LR
     P2["2. Move detection: ret_z, ret, vol_z"]
     P3["3. Decomposition and routing: OLS on SPY and ETF"]
     P4["4. News fetch: one NewsSource query per routing bucket"]
-    P5["5. Scoring: relevance 0-1, category"]
+    P5["5. Scoring: heuristic 5-part relevance 0-1, category, then model re-score of top-K"]
     P6["6. Explanation: top-N moves by abs ret_z"]
     P1 --> P2 --> P3 --> P4 --> P5 --> P6
   end
@@ -221,6 +221,13 @@ A row exists for any day with `abs(ret_z) >= 2.0` or `abs(ret) >= 0.02` at inges
 | `relevance` | real | 0–1 from the provider |
 | `category` | text | `company`, `industry`, or `macro` |
 | `provider` | text | `anthropic` or `heuristic`; v2 trains only on `anthropic` rows |
+| `bucket_match` | real | 0–1, article category vs the move's dominant component (weight 0.35) |
+| `entity_match` | real | 0–1, company/ticker in title = 1, peer or industry term = 0.5 (weight 0.20) |
+| `timing` | real | 0–1, before the move or a report naming the move = 1 (weight 0.15) |
+| `source_tier` | real | 0–1, static outlet tier list (weight 0.15) |
+| `coverage` | real | 0–1, distinct sources on the same story, capped at 10 (weight 0.15) |
+| `timing_kind` | text | `cause` (published before the move) or `report` (after, names the move) |
+| `model_score` | real, nullable | the model's own 0–1 when a key was present; `relevance` is then the mean of heuristic and model |
 
 ### `explanations`
 

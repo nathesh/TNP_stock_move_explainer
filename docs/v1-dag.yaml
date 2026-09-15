@@ -29,6 +29,8 @@ tasks:
       - tests/conftest.py
       - tests/test_models.py
     prompt: |
+      DECISION ADDED 2026-09-15 (docs/architecture-v1.md, move_articles): store the five heuristic components (bucket_match, entity_match, timing, source_tier, coverage), timing_kind ('cause' or 'report') and a nullable model_score on move_articles; relevance is the weighted sum (0.35/0.20/0.15/0.15/0.15), or the mean of that and model_score when a key is present.
+
       TASK T1 — settings, engine, tables. Everything downstream imports from these three modules, so the names
       and signatures below are a contract; implement them exactly.
 
@@ -472,6 +474,8 @@ tasks:
       - src/stock_moves/scoring.py
       - tests/test_scoring.py
     prompt: |
+      DECISION ADDED 2026-09-15 (docs/architecture-v1.md, move_articles): store the five heuristic components (bucket_match, entity_match, timing, source_tier, coverage), timing_kind ('cause' or 'report') and a nullable model_score on move_articles; relevance is the weighted sum (0.35/0.20/0.15/0.15/0.15), or the mean of that and model_score when a key is present.
+
       DECISION ADDED 2026-09-15 (DESIGN.md section 4): the heuristic scorer runs on every headline and keeps the top-K per move (K from settings, default 15); when a key is present the Anthropic provider re-scores only those K and the stored relevance is the mean of heuristic and model scores; store the heuristic components so they are inspectable.
 
       TASK T7 — DESIGN §3 storage and §4 scoring: articles are stored once (dedupe on URL) and linked to
