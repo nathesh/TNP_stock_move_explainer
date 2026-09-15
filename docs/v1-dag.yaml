@@ -1,0 +1,1004 @@
+# v1 task DAG for stock-move-explainer. Human twin: docs/v1-plan.md.
+# Each `prompt` is handed to one coding agent verbatim. Common preamble for every agent:
+#   - Work only in /Users/thejasprasad/Documents/tetrix-take-home. Read DESIGN.md first; it is the source
+#     of truth and must not be changed. docs/architecture-v1.md holds the table columns.
+#   - Package: src/stock_moves (Python 3.12, uv). Touch only the files in `owns`. No new dependencies.
+#   - Before reporting run: uv run ruff check . && uv run ruff format . && uv run pytest -q
+#   - No network calls inside pytest. Report the exact files changed and the public names exposed.
+common_preamble: |
+  You are implementing one task of a 4-hour Python take-home. Repo: /Users/thejasprasad/Documents/tetrix-take-home
+  (package src/stock_moves, Python 3.12, uv, pytest, ruff). First read DESIGN.md completely; it is the source of
+  truth and you must not change it. docs/architecture-v1.md has the exact table columns. Then do the task below.
+  Rules: touch only the files listed under OWNS; add no dependencies; type-hint everything; never call the
+  network inside pytest; if an upstream module is not there yet, code against the signature given here and make
+  your tests exercise your own code. Before reporting run from the repo root:
+  uv run ruff check . && uv run ruff format . && uv run pytest -q
+  Report: absolute paths of files created/edited, public names exposed, the test result, any deviation.
+
+tasks:
+  - id: T1
+    title: Settings, SQLite engine, SQLModel tables, test DB fixture
+    wave: 1
+    depends_on: []
+    critical_path: true
+    estimate_min: 25
+    owns:
+      - src/stock_moves/settings.py
+      - src/stock_moves/db.py
+      - src/stock_moves/models.py
+      - tests/conftest.py
+      - tests/test_models.py
+    prompt: |
+      TASK T1 — settings, engine, tables. Everything downstream imports from these three modules, so the names
+      and signatures below are a contract; implement them exactly.
+
+      OWNS: src/stock_moves/settings.py, src/stock_moves/db.py, src/stock_moves/models.py, tests/conftest.py,
+      tests/test_models.py.
+
+      1) src/stock_moves/settings.py
+         from pydantic import BaseModel; use python-dotenv to load a .env file from the repo root if present.
+         class Settings(BaseModel):
+             anthropic_api_key: str | None = None      # env ANTHROPIC_API_KEY
+             anthropic_model: str = "claude-opus-5"    # env ANTHROPIC_MODEL
+             news_source: str = "google_rss"           # env NEWS_SOURCE, "google_rss" | "gdelt"
+             db_path: Path = Path("data/app.db")       # env DB_PATH
+             default_period: str = "1y"
+             default_top_n: int = 10
+             default_z_threshold: float = 2.0
+             default_pct_threshold: float = 0.02
+             top_k_articles: int = 8                   # articles handed to the explainer
+             news_limit: int = 30                      # items per news query
+             gdelt_throttle_s: float = 5.0
+             http_timeout_s: float = 20.0
+         def get_settings() -> Settings   # @functools.lru_cache; reads os.environ (after load_dotenv) for every
+                                          # field using the upper-cased field name; empty strings count as unset.
+         Tests will call get_settings.cache_clear() after monkeypatching env.
+
+      2) src/stock_moves/db.py
+         Module-level cached engine. SQLite; for file paths create the parent directory; connect_args
+         {"check_same_thread": False}; for "sqlite://" (in-memory) use sqlalchemy.pool.StaticPool so every session
+         shares one connection.
+         def configure_engine(url: str) -> Engine   # replaces the cached engine, returns it
+         def get_engine() -> Engine                 # cached, else built from f"sqlite:///{get_settings().db_path}"
+         def init_db(engine: Engine | None = None) -> None      # SQLModel.metadata.create_all
+         def get_session() -> Iterator[Session]     # generator: `with Session(get_engine()) as s: yield s`
+         @contextmanager def session_scope() -> Iterator[Session]   # commit on success, rollback on error
+         Also `from sqlmodel import Session` re-exported so callers can `from stock_moves.db import Session`.
+
+      3) src/stock_moves/models.py — SQLModel tables (table=True), __tablename__ exactly as listed, columns from
+         docs/architecture-v1.md. Use `from datetime import date, datetime`, `Field`, `UniqueConstraint`.
+         Company (companies): ticker: str PK; name: str; sector: str|None; industry: str|None; sector_etf: str|None;
+           peers_json: str = "[]"; updated_at: datetime (default utcnow). Property `peers -> list[str]` (json.loads).
+         Price (prices): id int PK; ticker str index; date date index; open, high, low, close, volume: float;
+           ret, gap_ret, intraday_ret, ret_z, vol_z, mkt_component, sector_component, idio_component: float|None;
+           routing: str|None; regime_mkt: str|None; regime_sector: str|None; near_earnings: bool = False.
+           UniqueConstraint("ticker", "date", name="uq_price_ticker_date").
+         Move (moves): id PK; ticker index; date index; ret, ret_z: float; gap_ret, intraday_ret, vol_z,
+           mkt_component, sector_component, idio_component: float|None; routing: str; direction: str ("up"/"down");
+           regime_mkt, regime_sector: str|None; near_earnings: bool = False; peer_comove: float|None;
+           created_at datetime. UniqueConstraint("ticker", "date", name="uq_move_ticker_date").
+         Article (articles): id PK; url: str unique index; title: str; source: str|None; language: str|None;
+           published_at: datetime|None; news_source: str ("google_rss"|"gdelt"); fetched_at datetime.
+         MoveArticle (move_articles): move_id: int FK moves.id PK; article_id: int FK articles.id PK;
+           relevance: float; category: str; provider: str.
+         Explanation (explanations): id PK; move_id int FK moves.id unique; summary: str; primary_category: str;
+           confidence: float; cited_article_ids_json: str = "[]"; unexplained: bool = False; provider: str;
+           created_at datetime. Property `cited_article_ids -> list[int]`.
+         ChatMessage (chat_messages): id PK; session_id str index; role str ("user"|"assistant"|"tool");
+           content str; tool_calls_json: str|None; created_at datetime.
+
+      4) tests/conftest.py — pytest fixtures shared by every later test module:
+         @pytest.fixture def session() -> Iterator[Session]: configure_engine("sqlite://"); init_db(); yield a
+         Session; on teardown dispose the engine. Also a fixture `no_api_key(monkeypatch)` that deletes
+         ANTHROPIC_API_KEY from the env and calls get_settings.cache_clear(). Keep this file to those two fixtures;
+         other tasks add their own fixtures inside their own test files.
+
+      5) tests/test_models.py — using the `session` fixture: insert one row per table (a Move that references a
+         Price date, a MoveArticle linking them, an Explanation, a ChatMessage) and read them back; inserting a
+         second Price with the same (ticker, date) raises sqlalchemy.exc.IntegrityError; Company.peers parses
+         peers_json; get_settings() defaults are as listed and DB_PATH env overrides db_path.
+
+      ACCEPTANCE: uv run pytest -q tests/test_models.py passes; ruff clean.
+
+  - id: T2
+    title: ModelProvider protocol, HeuristicProvider, chat tool specs
+    wave: 1
+    depends_on: []
+    critical_path: false
+    estimate_min: 30
+    owns:
+      - src/stock_moves/providers/__init__.py
+      - src/stock_moves/providers/base.py
+      - src/stock_moves/providers/heuristic.py
+      - tests/test_heuristic_provider.py
+    prompt: |
+      TASK T2 — the model layer interface (DESIGN §4) and the keyless implementation. Do NOT import
+      stock_moves.models or stock_moves.settings here except lazily inside get_provider(); wave-1 modules land
+      in parallel and this one must import cleanly on its own.
+
+      OWNS: src/stock_moves/providers/__init__.py, providers/base.py, providers/heuristic.py,
+      tests/test_heuristic_provider.py.
+
+      1) providers/base.py — plain dataclasses (frozen where noted), a Protocol, and two constants.
+         @dataclass(frozen=True) class ArticleInput: id: int; title: str; source: str | None; url: str;
+             published_at: datetime | None
+             @classmethod from_object(cls, a: Any) -> ArticleInput   # reads attributes by name (duck-typed)
+         @dataclass(frozen=True) class MoveContext: ticker: str; company_name: str; date: date; ret: float;
+             ret_z: float; gap_ret: float|None; intraday_ret: float|None; vol_z: float|None;
+             mkt_component: float|None; sector_component: float|None; idio_component: float|None; routing: str;
+             direction: str; regime_mkt: str|None; regime_sector: str|None; near_earnings: bool;
+             sector: str|None; industry: str|None; peers: tuple[str, ...]; peer_comove: float|None
+             @classmethod from_objects(cls, move: Any, company: Any) -> MoveContext
+                 # move has the Move table's attributes; company has name/sector/industry/peers (a list).
+                 # Read with getattr(obj, name, None); this is what lets wave-2 modules build a context
+                 # without this file importing models.py.
+         @dataclass(frozen=True) class ArticleScore: article_id: int; relevance: float; category: str
+             # category in {"company","industry","macro"}
+         @dataclass(frozen=True) class ExplanationResult: summary: str; primary_category: str;
+             confidence: float; cited_article_ids: tuple[int, ...]; unexplained: bool
+             # primary_category in {"company","industry","macro","unexplained"}; confidence in [0,1]
+         @dataclass class ChatTurn: role: str; content: str          # role "user" | "assistant"
+         @dataclass class ToolCallRecord: name: str; input: dict[str, Any]; output: Any
+         @dataclass class ChatReply: reply: str; tool_calls: list[ToolCallRecord]
+         ToolFn = Callable[..., Any]   # called with keyword args from the tool input; returns JSON-serialisable
+         MACRO_TERMS: tuple[str, ...] = ("federal reserve", "fed ", "fomc", "interest rate", "rate cut",
+             "rate hike", "inflation", "cpi", "ppi", "jobs report", "payrolls", "unemployment", "tariff",
+             "treasury", "yields", "recession", "gdp", "oil price", "crude", "dollar", "geopolit", "stimulus")
+         TOOL_SPECS: list[dict[str, Any]]   # Anthropic tool format: {"name", "description", "input_schema"}
+           list_moves: {ticker: string (optional, defaults to the session ticker), start: string YYYY-MM-DD opt,
+                        end: string opt, direction: "up"|"down" opt, limit: integer opt default 10}
+             description: "Largest daily moves for a ticker, sorted by absolute z-score, with the cached
+                           explanation summary when one exists."
+           get_move: {ticker: string opt, date: string YYYY-MM-DD required}
+             description: "One move with its decomposition, linked articles and explanation."
+           search_news: {ticker: string opt, query: string opt, start: string opt, end: string opt,
+                         limit: integer opt default 20}
+             description: "Headlines linked to a ticker's moves, filtered by a substring of the title."
+           Return shapes (documented in the descriptions, implemented in T10 queries.py):
+             move dict: {date, ret, ret_z, gap_ret, intraday_ret, vol_z, direction, routing, near_earnings,
+                         regime_mkt, regime_sector, mkt_component, sector_component, idio_component,
+                         peer_comove, explanation: {summary, primary_category, confidence, cited_article_ids,
+                         unexplained} | null, articles: [article dict] (get_move only)}
+             article dict: {id, title, source, url, published_at, relevance, category}
+         class ModelProvider(Protocol):
+             name: str
+             def score_articles(self, move: MoveContext, articles: Sequence[ArticleInput]) -> list[ArticleScore]: ...
+             def explain(self, move: MoveContext, scored: Sequence[tuple[ArticleInput, ArticleScore]]) -> ExplanationResult: ...
+             def suggest_peers(self, ticker: str, name: str, sector: str | None, industry: str | None) -> list[str]: ...
+             def chat(self, history: Sequence[ChatTurn], tools: Mapping[str, ToolFn], ticker: str | None) -> ChatReply: ...
+             # `scored` is sorted by relevance desc, already cut to top-K by the caller.
+             # `tools` maps the TOOL_SPECS names to callables that take **kwargs and return the dicts above.
+             # `history` ends with the newest user turn.
+
+      2) providers/heuristic.py — class HeuristicProvider (name = "heuristic"), no external calls.
+         score_articles: lower-case the title. relevance 1.0 and category "company" if the cleaned company name
+           (strip Inc/Corp/Corporation/Ltd/plc/Co/Holdings and punctuation; also try the first word if the name
+           has 2+ words and the first word is 4+ letters) or the ticker (as a whole word, only when len>=3) is in
+           the title; else 0.7/"industry" if a peer ticker (whole word) or the industry string is in the title;
+           else 0.5/"macro" if any MACRO_TERMS hit; else 0.1 with category = move.routing.
+         explain: relevant = [s for s in scored if s.relevance >= 0.5]. If not relevant and abs(ret_z) < 3:
+           ExplanationResult(summary=f"{ticker} moved {ret:+.1%} on {date} (z={ret_z:+.1f}); no headline in the
+           ±1 day window matched the company, its peers or macro terms.", primary_category="unexplained",
+           confidence=0.2, cited_article_ids=(), unexplained=True). Otherwise primary_category = move.routing;
+           summary is 2-3 templated sentences: direction and size; which component dominated with the three
+           components in percentage points; "The day was inside an earnings window." when near_earnings;
+           peer co-movement when peer_comove is not None; then "Related headlines: " + up to 3 titles with
+           source. confidence = min(0.9, 0.3 + 0.15*min(len(relevant),3) + 0.2*(near_earnings) +
+           0.1*(dominant share >= 0.6)) where dominant share = abs(dominant component)/sum of abs components
+           (0 if all None). cited_article_ids = ids of up to 3 relevant articles.
+         suggest_peers: return [].
+         chat: rule-based single tool call. ticker = the `ticker` arg, else the first whole-word match of
+           r"\b[A-Z]{2,5}\b" in the last user turn that is not in a stoplist {"I","A","THE","WHY","DID","WHAT",
+           "HOW","IS","IT","ON","IN","OF","TO","AND","OR","FOR","USD","CEO","AI","US","ETF"}; if none, reply
+           "Tell me a ticker, e.g. 'why did NVDA drop on 2025-08-28?'" with no tool calls. date = first
+           r"\d{4}-\d{2}-\d{2}" match. If "news" or "headline" in the text -> search_news(ticker=..., limit=10);
+           elif date -> get_move(ticker, date); else list_moves(ticker, direction=("down" if any of drop/fall/
+           down/plunge/sank in text else "up" if any of jump/rise/up/rally/soar else None), limit=5).
+           Wrap the call in try/except and put the error string in the reply if it fails. Render a plain-text
+           reply: for get_move — the explanation summary (or "No explanation yet") plus up to 3 headlines; for
+           list_moves — one line per move "YYYY-MM-DD  ret  z  routing  summary-or-blank"; for search_news — one
+           line per article. Return ChatReply(reply, [ToolCallRecord(name, input, output)]).
+
+      3) providers/__init__.py
+         def get_provider(settings: Any | None = None) -> ModelProvider:
+             lazily `from stock_moves.settings import get_settings` if settings is None; if
+             settings.anthropic_api_key: try `from stock_moves.providers.anthropic import AnthropicProvider` and
+             return AnthropicProvider(api_key=..., model=settings.anthropic_model); on ImportError fall through.
+             Return HeuristicProvider(). Re-export the base names.
+
+      4) tests/test_heuristic_provider.py — build MoveContext by hand (no DB): scoring cases above; explain
+         unexplained case and a routed case citing <=3 ids; chat with fake tools (dicts of lambdas recording
+         calls): "what happened to TEST on 2025-06-03" calls get_move once with ticker "TEST", date "2025-06-03";
+         "any news on TEST" calls search_news; "why did TEST drop" calls list_moves with direction "down";
+         a message with no ticker makes no tool call. Also test MoveContext.from_objects with SimpleNamespace.
+
+      ACCEPTANCE: uv run pytest -q tests/test_heuristic_provider.py passes; ruff clean.
+
+  - id: T3
+    title: Move maths as pure DataFrame functions
+    wave: 1
+    depends_on: []
+    critical_path: false
+    estimate_min: 35
+    owns:
+      - src/stock_moves/moves.py
+      - tests/synth.py
+      - tests/test_moves.py
+    prompt: |
+      TASK T3 — DESIGN §1 as pure functions over pandas DataFrames. No I/O, no imports from other stock_moves
+      modules. Every function takes/returns frames indexed by a tz-naive DatetimeIndex named "date", sorted
+      ascending, with lower-case columns open, high, low, close, volume.
+
+      OWNS: src/stock_moves/moves.py, tests/synth.py, tests/test_moves.py.
+
+      src/stock_moves/moves.py:
+        def compute_returns(df: pd.DataFrame) -> pd.DataFrame
+            # returns a copy with ret = close.pct_change(), gap_ret = open/close.shift(1) - 1,
+            # intraday_ret = close/open - 1
+        def rolling_z(series: pd.Series, window: int = 20) -> pd.Series
+            # series / series.shift(1).rolling(window, min_periods=window).std(); today excluded from the std
+        def volume_z(volume: pd.Series, window: int = 20) -> pd.Series
+            # volume / volume.shift(1).rolling(window, min_periods=window).mean()
+        def decompose(ret: pd.Series, ret_mkt: pd.Series, ret_sec: pd.Series | None, window: int = 60) -> pd.DataFrame
+            # For each day t, OLS with intercept of ret on [ret_mkt, ret_sec] over the `window` days ending at
+            # t-1 (exclusive of t), numpy.linalg.lstsq on the aligned, NaN-dropped window; require at least
+            # `window` rows else NaN. Columns: beta_mkt, beta_sec, alpha, mkt_component = beta_mkt*ret_mkt[t],
+            # sector_component = beta_sec*ret_sec[t], idio_component = ret[t] - mkt - sector.
+            # If ret_sec is None: beta_sec = 0.0, sector_component = 0.0 (still regress on mkt only).
+            # Vectorise or loop; 300 rows must run well under a second.
+        def route(mkt_component: float, sector_component: float, idio_component: float) -> str
+            # scalar; largest absolute value wins: "macro" (mkt), "industry" (sector), "company" (idio);
+            # any NaN/None -> "company"; exact ties -> "company".
+        def regime(close: pd.Series, fast: int = 50, slow: int = 200) -> pd.Series
+            # "bull" if SMA(fast) >= SMA(slow) else "bear"; None where SMA(slow) is NaN (use min_periods=slow).
+            # If the series is shorter than `slow`, fall back to min_periods=max(fast, len//2) so a 1y history
+            # still gets a label after the first ~125 rows; document this in the docstring.
+        def near_earnings(index: pd.DatetimeIndex, earnings_dates: Iterable[date | datetime], tolerance: int = 1) -> pd.Series
+            # bool per index position: True if a trading day within `tolerance` positions in the index (not
+            # calendar days) has a date equal to an earnings date. Earnings dates that are not trading days map
+            # to the next trading day at or after them. Future dates beyond the index are ignored.
+        def peer_comove(peer_returns: pd.DataFrame, dates: pd.DatetimeIndex) -> pd.Series
+            # peer_returns: one column per peer of daily ret; mean across peers per date (skipna); NaN if empty.
+        def build_features(stock: pd.DataFrame, spy: pd.DataFrame, etf: pd.DataFrame | None,
+                           earnings_dates: Iterable[date] = (), z_window: int = 20, ols_window: int = 60) -> pd.DataFrame
+            # Inner-join on index with spy (and etf if given). Output has the OHLCV columns plus exactly:
+            # ret, gap_ret, intraday_ret, ret_z, vol_z, mkt_component, sector_component, idio_component,
+            # routing, regime_mkt, regime_sector, near_earnings. regime_sector None if etf is None.
+            # routing applied row-wise via route(); rows where ret is NaN keep routing None.
+        def detect_moves(features: pd.DataFrame, z_threshold: float = 2.0, pct_threshold: float = 0.02) -> pd.DataFrame
+            # rows where abs(ret_z) >= z_threshold OR abs(ret) >= pct_threshold (NaN ret_z counts as not
+            # passing the z test but abs(ret) can still pass); adds direction = "up"/"down"; sorted by
+            # abs(ret_z) desc (NaN last).
+
+      tests/synth.py (plain module, importable from tests because tests/conftest.py puts tests/ on sys.path):
+        def synthetic_ohlcv(n_days: int = 320, seed: int = 0, daily_vol: float = 0.01, drift: float = 0.0003,
+                            shocks: dict[int, float] | None = None, start: str = "2025-01-02") -> pd.DataFrame
+            # business-day index named "date", geometric random walk close, open = prev close*(1+small noise),
+            # high/low bracket open/close, volume lognormal around 1e6; shocks {position: return} injected
+            # into that day's close-to-close return. Deterministic for a seed.
+        def synthetic_market(n_days: int, seed: int, correlate_with: pd.Series | None = None, beta: float = 0.8) -> pd.DataFrame
+            # optional helper: a frame whose returns are beta*given returns + noise (so OLS has signal).
+
+      tests/test_moves.py: stock = synthetic_ohlcv(shocks={250: -0.08}); spy, etf from synthetic helpers.
+        - build_features has every column above, same length as the inner join, no exception.
+        - detect_moves at defaults contains the shock date, direction "down"; with z_threshold=50 and
+          pct_threshold=0.5 returns empty; with pct_threshold=0.0 returns every row with a non-NaN ret.
+        - route(0.01, 0.02, 0.005) == "industry"; route(0.03, 0.0, 0.01) == "macro"; route(nan, 1, 1) == "company";
+          route(0.01, 0.01, 0.01) == "company".
+        - rolling_z: first `window` values NaN; a constant series after warm-up yields NaN/inf-free handling
+          (std 0 -> NaN, not exception).
+        - regime on a rising series is "bull" at the end, on a falling series "bear".
+        - near_earnings with an earnings date equal to index[100] is True at positions 99, 100, 101 only.
+        - decompose with etf None gives sector_component == 0.0 after warm-up; with a market built as
+          beta 0.8 * stock noise the fitted beta_mkt is within 0.4 of the truth on the last row.
+
+      ACCEPTANCE: uv run pytest -q tests/test_moves.py passes in under 5 s; ruff clean.
+
+  - id: T4
+    title: yfinance prices, sector ETF map, info and earnings dates
+    wave: 1
+    depends_on: []
+    critical_path: false
+    estimate_min: 25
+    owns:
+      - src/stock_moves/prices.py
+      - tests/test_prices.py
+    prompt: |
+      TASK T4 — price and metadata fetch (DESIGN §1, §2 inputs). Facts verified on 2026-09-15 you can rely on:
+      yfinance `Ticker(t).history(period="1y")` returns ~251 rows with a tz-aware DatetimeIndex and columns
+      Open/High/Low/Close/Volume/Dividends/Stock Splits; `Ticker(t).info` has "shortName", "longName",
+      "sector", "industry"; `Ticker(t).earnings_dates` is a DataFrame indexed by tz-aware datetime including
+      future dates (it can be None or raise for some tickers).
+
+      OWNS: src/stock_moves/prices.py, tests/test_prices.py. No imports from other stock_moves modules.
+
+      src/stock_moves/prices.py:
+        MARKET_ETF = "SPY"
+        SECTOR_ETF: dict[str, str] = {"Technology": "XLK", "Financial Services": "XLF", "Energy": "XLE",
+            "Healthcare": "XLV", "Consumer Cyclical": "XLY", "Consumer Defensive": "XLP", "Industrials": "XLI",
+            "Basic Materials": "XLB", "Utilities": "XLU", "Real Estate": "XLRE", "Communication Services": "XLC"}
+        class PriceFetchError(RuntimeError)
+        @dataclass(frozen=True) class TickerInfo: ticker: str; name: str; sector: str | None;
+            industry: str | None; sector_etf: str | None
+        def sector_etf_for(sector: str | None) -> str | None
+        def normalize_ohlcv(raw: pd.DataFrame) -> pd.DataFrame
+            # pure: accept the yfinance history frame (or a MultiIndex-column download frame: take level 0);
+            # keep Open/High/Low/Close/Volume -> lower-case; index -> tz-naive, normalized to midnight, named
+            # "date", sorted, duplicates dropped (keep last); drop rows where close is NaN; volume as float.
+        def fetch_ohlcv(ticker: str, period: str = "1y") -> pd.DataFrame
+            # yf.Ticker(ticker).history(period=period, auto_adjust=False) -> normalize_ohlcv; raise
+            # PriceFetchError(f"no price data for {ticker}") when empty.
+        def fetch_info(ticker: str) -> TickerInfo
+            # name = info.get("shortName") or info.get("longName") or ticker; sector/industry may be None;
+            # sector_etf = sector_etf_for(sector). Any exception -> TickerInfo(ticker, ticker, None, None, None).
+        def fetch_earnings_dates(ticker: str, limit: int = 12) -> list[date]
+            # from Ticker.get_earnings_dates(limit=limit) (fallback .earnings_dates); index -> tz-naive .date();
+            # sorted unique; [] on None/exception. Future dates are kept (T3 ignores them).
+        def fetch_peer_returns(peers: Sequence[str], period: str = "1y") -> pd.DataFrame
+            # one column per peer of close.pct_change(); peers that fail are skipped; empty frame if none.
+        All fetchers are looked up by name at call time by other modules (ingest does
+        `from stock_moves import prices; prices.fetch_ohlcv(...)`), so keep them module-level functions.
+
+      tests/test_prices.py (no network): normalize_ohlcv on a hand-built frame with tz-aware index
+      ("America/New_York"), capitalised columns, a duplicate date and a NaN close -> lower-case columns,
+      tz-naive index named "date", duplicate collapsed, NaN row dropped; MultiIndex-column input handled;
+      sector_etf_for known/unknown/None. Add a `@pytest.mark.skip(reason="network")` smoke test that would
+      fetch AAPL, so T15 can run it by hand with `-m` removed.
+
+      ACCEPTANCE: uv run pytest -q tests/test_prices.py passes; ruff clean.
+
+  - id: T5
+    title: News sources — protocol, Google News RSS primary, GDELT throttled fallback, bucket queries
+    wave: 1
+    depends_on: []
+    critical_path: false
+    estimate_min: 35
+    owns:
+      - src/stock_moves/news/__init__.py
+      - src/stock_moves/news/base.py
+      - src/stock_moves/news/google_rss.py
+      - src/stock_moves/news/gdelt.py
+      - tests/test_news.py
+    prompt: |
+      TASK T5 — DESIGN §3. Two keyless news sources behind one protocol, plus the query builders per routing
+      bucket. No imports from other stock_moves modules (settings values are passed in as arguments).
+      "Article" in DESIGN §3's protocol signature is realised here as the plain record NewsItem; the mapping to
+      the `articles` table happens in scoring.py (T7), not here.
+
+      OWNS: src/stock_moves/news/__init__.py, news/base.py, news/google_rss.py, news/gdelt.py, tests/test_news.py.
+
+      news/base.py:
+        @dataclass(frozen=True) class NewsItem: url: str; title: str; source: str | None;
+            published_at: datetime | None; language: str | None; news_source: str; bucket: str
+        class NewsSource(Protocol):
+            name: str
+            def search(self, query: str, start: date, end: date, limit: int = 30) -> list[NewsItem]: ...
+        MACRO_QUERY_TERMS: tuple[str, ...] = ("Federal Reserve", "interest rates", "inflation", "CPI", "tariffs",
+            "jobs report", "Treasury yields", "recession", "stock market")
+        def clean_company_name(name: str) -> str
+            # strip suffixes (Inc, Inc., Corp, Corporation, Ltd, plc, Co, Company, Holdings, Group, N.V., S.A.,
+            # "The " prefix), trailing commas/periods; "Apple Inc." -> "Apple"; "NVIDIA Corporation" -> "NVIDIA".
+        def window_for(move_date: date, before: int = 1, after: int = 1) -> tuple[date, date]
+        def build_query(bucket: str, company_name: str, ticker: str, peers: Sequence[str] = (),
+                        industry: str | None = None) -> str
+            # company:  '"<clean name>" stock' + (f' OR {ticker}' if len(ticker) >= 3 else "")
+            # industry: '("<clean name>" OR <peer1> OR <peer2>... OR "<industry>") stock'  (skip missing parts)
+            # macro:    '(' + ' OR '.join(f'"{t}"' for t in MACRO_QUERY_TERMS) + ') stock market'
+            # anything else -> ValueError
+        def queries_for_move(routing: str, company_name: str, ticker: str, peers: Sequence[str] = (),
+                             industry: str | None = None) -> list[tuple[str, str]]
+            # [(bucket, query)]: always the company query first; plus the industry or macro query when routing
+            # is "industry" or "macro". This is "one query per move per routing bucket" with a company baseline.
+        def get_news_source(name: str = "google_rss", *, timeout_s: float = 20.0, throttle_s: float = 5.0) -> NewsSource
+            # "google_rss" -> GoogleNewsRSS(timeout_s); "gdelt" -> GDELTSource(timeout_s, throttle_s); else ValueError
+
+      news/google_rss.py — class GoogleNewsRSS (name = "google_rss"):
+        __init__(self, timeout_s: float = 20.0, client: httpx.Client | None = None)
+        URL: https://news.google.com/rss/search?q=<urlencoded>&hl=en-US&gl=US&ceid=US:en where the query is
+        f"{query} after:{start:%Y-%m-%d} before:{end + 1 day:%Y-%m-%d}" (Google's before: is exclusive).
+        Send a desktop User-Agent header. Parse with xml.etree.ElementTree: for each channel/item read title,
+        link, pubDate (email.utils.parsedate_to_datetime -> tz-aware UTC), and the <source> element's text as
+        the outlet name. If the title ends with " - <source>" strip that suffix. Dedupe on link, keep order,
+        cut to `limit`. Any httpx error, non-200, or parse error -> return [] (log a warning). language=None.
+        def parse_rss(xml_text: str, bucket: str = "") -> list[NewsItem]   # pure, module-level
+        search(...) sets bucket="" ; callers set the bucket via dataclasses.replace.
+
+      news/gdelt.py — class GDELTSource (name = "gdelt"):
+        __init__(self, timeout_s: float = 20.0, throttle_s: float = 5.0, client: httpx.Client | None = None)
+        URL https://api.gdeltproject.org/api/v2/doc/doc with params mode=artlist, format=json, sort=hybridrel,
+        maxrecords=limit, startdatetime=f"{start:%Y%m%d}000000", enddatetime=f"{end:%Y%m%d}235959",
+        query=f"{query} sourcelang:english". Client-side throttle: a module-level last-call timestamp; sleep
+        so consecutive calls are >= throttle_s apart (use time.monotonic and time.sleep, both looked up on the
+        module so tests can monkeypatch them). Parse payload["articles"]: url, title, domain -> source,
+        seendate "YYYYMMDDTHHMMSSZ" -> datetime UTC, language. Non-JSON/empty/HTTP error -> [].
+        def parse_gdelt(payload: dict, bucket: str = "") -> list[NewsItem]   # pure
+
+      news/__init__.py re-exports NewsItem, NewsSource, get_news_source, queries_for_move, build_query,
+      window_for, clean_company_name, GoogleNewsRSS, GDELTSource.
+
+      tests/test_news.py (no network): clean_company_name cases; build_query for the three buckets (company
+      query for ("Apple Inc.", "AAPL") == '"Apple" stock OR AAPL'; ticker "GE" is not appended);
+      queries_for_move returns 1 query for company routing and 2 for industry/macro; window_for; parse_rss on
+      an inline RSS string with two items (one duplicate link) -> 2 unique items with sources, dates and
+      stripped titles; GoogleNewsRSS.search using httpx.MockTransport that asserts the request URL contains
+      "after%3A" and returns the fixture; GDELTSource.search with MockTransport; GDELT throttle: monkeypatch
+      time.sleep to record calls, call search twice -> sleep called with a value in (0, 5].
+
+      ACCEPTANCE: uv run pytest -q tests/test_news.py passes; ruff clean.
+
+  - id: T6
+    title: Company ontology (companies table + peers)
+    wave: 2
+    depends_on: [T1, T2, T4]
+    critical_path: false
+    estimate_min: 20
+    owns:
+      - src/stock_moves/ontology.py
+      - tests/test_ontology.py
+    prompt: |
+      TASK T6 — DESIGN §2. The companies row: name/sector/industry/sector_etf from yfinance, peers from one
+      provider call (heuristic returns []).
+
+      OWNS: src/stock_moves/ontology.py, tests/test_ontology.py.
+      USES (already landed): stock_moves.models.Company; stock_moves.prices (TickerInfo, fetch_info — call it as
+      `prices.fetch_info(...)` through the module so tests can monkeypatch it); stock_moves.providers.base
+      (ModelProvider).
+
+      src/stock_moves/ontology.py:
+        def upsert_company(session: Session, info: TickerInfo, peers: Sequence[str]) -> Company
+            # insert or update by ticker; peers_json = json.dumps(sorted(set(p.upper() for p in peers if p)));
+            # updated_at = now; commit; return the row.
+        def get_or_build_company(session: Session, ticker: str, provider: ModelProvider, *, refresh: bool = False) -> Company
+            # ticker upper-cased. If a row exists and not refresh -> return it. Else info = prices.fetch_info(ticker);
+            # peers = provider.suggest_peers(ticker, info.name, info.sector, info.industry) wrapped in try/except
+            # (-> [] on error); never include the ticker itself in peers; upsert and return.
+        def peers_of(company: Company) -> list[str]
+
+      tests/test_ontology.py: `session` fixture from conftest; monkeypatch stock_moves.prices.fetch_info to
+      return TickerInfo("TEST", "Test Corp", "Technology", "Semiconductors", "XLK"); a provider stub whose
+      suggest_peers returns ["AAA", "test", "bbb"] -> peers_json == '["AAA","BBB"]' (ticker excluded, upper,
+      sorted); second call does not call fetch_info (count the calls); refresh=True calls it again; a provider
+      whose suggest_peers raises -> peers [].
+
+      ACCEPTANCE: uv run pytest -q tests/test_ontology.py passes; ruff clean.
+
+  - id: T7
+    title: Article upsert, scoring and move linking
+    wave: 2
+    depends_on: [T1, T2, T5]
+    critical_path: true
+    estimate_min: 30
+    owns:
+      - src/stock_moves/scoring.py
+      - tests/test_scoring.py
+    prompt: |
+      TASK T7 — DESIGN §3 storage and §4 scoring: articles are stored once (dedupe on URL) and linked to
+      moves through move_articles with relevance and category from the provider.
+
+      OWNS: src/stock_moves/scoring.py, tests/test_scoring.py.
+      USES: stock_moves.models (Article, Move, MoveArticle, Company); stock_moves.news.base.NewsItem;
+      stock_moves.providers.base (ModelProvider, ArticleInput, MoveContext, ArticleScore).
+
+      src/stock_moves/scoring.py:
+        def upsert_articles(session: Session, items: Sequence[NewsItem]) -> list[Article]
+            # dedupe items on url (keep first); for each url select existing Article or insert one
+            # (title, source, language, published_at, news_source, fetched_at=now); commit once; return rows in
+            # the order of the deduped input.
+        def to_inputs(articles: Sequence[Article]) -> list[ArticleInput]      # ArticleInput.from_object
+        def score_and_link(session: Session, move: Move, company: Company, articles: Sequence[Article],
+                           provider: ModelProvider) -> list[MoveArticle]
+            # ctx = MoveContext.from_objects(move, company); scores = provider.score_articles(ctx, to_inputs(articles))
+            # (if the provider returns fewer scores than articles, missing ones get relevance 0.0 and category
+            # move.routing; clamp relevance to [0,1]; category not in {company,industry,macro} -> move.routing).
+            # Delete existing MoveArticle rows for move.id, insert new ones with provider=provider.name, commit,
+            # return them sorted by relevance desc.
+        def linked_articles(session: Session, move_id: int, min_relevance: float = 0.0) -> list[tuple[Article, MoveArticle]]
+            # join, relevance desc. (queries.py in T10 has a similar read; this one exists so explain.py and
+            # ingest.py do not depend on T10.)
+
+      tests/test_scoring.py: with the `session` fixture insert a Company("TEST", "Test Corp", sector
+      "Technology", industry "Semiconductors", peers ["PEER"]) and a Move (date 2025-06-03, ret -0.05,
+      ret_z -2.5, routing "company", direction "down"). Items: same url twice, one title "Test Corp shares
+      slide after guidance cut", one "Fed holds rates", one "PEER stock tumbles". upsert_articles -> 3 rows,
+      calling again adds none. score_and_link with HeuristicProvider -> links with relevance 1.0/company,
+      0.5/macro, 0.7/industry; calling again leaves exactly 3 links; linked_articles(min_relevance=0.6)
+      returns 2. A stub provider returning an empty list -> every link relevance 0.0, category "company".
+
+      ACCEPTANCE: uv run pytest -q tests/test_scoring.py passes; ruff clean.
+
+  - id: T8
+    title: Explanation build and cache
+    wave: 2
+    depends_on: [T1, T2]
+    critical_path: false
+    estimate_min: 30
+    owns:
+      - src/stock_moves/explain.py
+      - tests/test_explain.py
+    prompt: |
+      TASK T8 — DESIGN §4 explanation: build the context, call the provider, cache one row per move.
+
+      OWNS: src/stock_moves/explain.py, tests/test_explain.py.
+      USES: stock_moves.models (Move, Company, Article, MoveArticle, Explanation); stock_moves.providers.base
+      (ModelProvider, MoveContext, ArticleInput, ArticleScore, ExplanationResult). Do NOT import scoring.py
+      (it lands in parallel); write your own small join for the move's articles.
+
+      src/stock_moves/explain.py:
+        def top_scored(session: Session, move_id: int, top_k: int = 8) -> list[tuple[ArticleInput, ArticleScore]]
+            # join move_articles->articles for the move, relevance desc, cut to top_k, mapped to base types.
+        def build_context(move: Move, company: Company) -> MoveContext     # MoveContext.from_objects
+        def get_or_create_explanation(session: Session, move: Move, company: Company, provider: ModelProvider,
+                                      *, top_k: int = 8, refresh: bool = False) -> Explanation
+            # existing row for move.id and not refresh -> return it. Else result = provider.explain(ctx, scored);
+            # validate: primary_category in {company,industry,macro,unexplained} else "unexplained";
+            # confidence clamped to [0,1]; cited ids restricted to ids in `scored`. Upsert the Explanation
+            # (update in place on refresh), provider=provider.name, created_at=now; commit; return.
+        def explanation_to_result(e: Explanation) -> ExplanationResult
+
+      tests/test_explain.py: `session` fixture; seed Company, Move, two Articles and MoveArticle links
+      (relevance 1.0 and 0.2); HeuristicProvider: first call creates a row with primary_category == "company"
+      and cited ids == [the 1.0 article]; second call returns the same id and does not call provider.explain
+      (wrap the provider to count calls); refresh=True calls it again and keeps one row; a stub provider
+      returning primary_category "nonsense", confidence 7 and a foreign id is normalised to "unexplained",
+      1.0, [].
+
+      ACCEPTANCE: uv run pytest -q tests/test_explain.py passes; ruff clean.
+
+  - id: T9
+    title: AnthropicProvider (scoring, explanation, peers, chat tool loop)
+    wave: 2
+    depends_on: [T2]
+    critical_path: false
+    estimate_min: 30
+    owns:
+      - src/stock_moves/providers/anthropic.py
+      - tests/test_anthropic_provider.py
+    prompt: |
+      TASK T9 — the keyed ModelProvider (DESIGN §4). Uses the official `anthropic` Python SDK (already
+      installed). Verified API shapes as of 2026: model id "claude-opus-5" (use exactly this string, no date
+      suffix); structured output is `client.messages.parse(model=..., max_tokens=..., messages=[...],
+      output_format=PydanticModel)` and the result is `response.parsed_output`; a manual tool loop is
+      `client.messages.create(model, max_tokens, system, tools, messages)` -> stop while
+      `response.stop_reason != "tool_use"`, else append {"role":"assistant","content":response.content}, run
+      each block with `.type == "tool_use"` (fields .id, .name, .input dict) and append one user message whose
+      content is a list of {"type":"tool_result","tool_use_id":block.id,"content":json.dumps(result)} (use
+      "is_error": True with the error text when a tool raises). Adaptive thinking is on by default for this
+      model; do not pass a `thinking` parameter, do not use `tool_choice` other than the default, no
+      assistant prefill. max_tokens 2048 for scoring/peers, 4096 for explanations and chat.
+
+      OWNS: src/stock_moves/providers/anthropic.py, tests/test_anthropic_provider.py.
+      USES: stock_moves.providers.base (all types, TOOL_SPECS, MACRO_TERMS), stock_moves.providers.heuristic
+      (HeuristicProvider, as the fallback).
+
+      class AnthropicProvider (name = "anthropic"):
+        __init__(self, api_key: str, model: str = "claude-opus-5", client: Any | None = None)
+            # client defaults to anthropic.Anthropic(api_key=api_key); tests inject a fake.
+        score_articles: one parse() call. Pydantic models: class _Score(BaseModel): article_id: int;
+            relevance: float; category: Literal["company","industry","macro"]; class _Scores(BaseModel):
+            scores: list[_Score]. System prompt: you are scoring headlines for whether they explain a given
+            stock move; relevance 1 = directly about this company on this day, 0 = unrelated; category is
+            what the headline is about. User content: the MoveContext fields as a compact JSON block, then the
+            articles as "id | date | source | title" lines. Return scores for the given ids only; missing ids
+            get relevance 0.0/category routing. On any exception -> HeuristicProvider().score_articles(...).
+        explain: one parse() call with class _Explanation(BaseModel): summary: str; primary_category:
+            Literal["company","industry","macro","unexplained"]; confidence: float; cited_article_ids: list[int];
+            unexplained: bool. System prompt (DESIGN §0): attribution, not causation; cite only the given
+            article ids; say `unexplained` when the evidence is weak; 2-4 sentences; mention the
+            decomposition, regime, earnings proximity and peer co-movement when informative. Fallback to
+            heuristic on exception.
+        suggest_peers: parse() with class _Peers(BaseModel): tickers: list[str]; ask for up to 6 US-listed
+            public peers by ticker, no ETFs; upper-case, drop the ticker itself; [] on exception.
+        chat: manual loop with tools=TOOL_SPECS, at most 6 iterations. system: "You explain stock moves using
+            only the tools' results; cite dates; if the tools return nothing say so. Default ticker: {ticker}."
+            Convert history ChatTurn -> messages. Execute tools from the `tools` mapping with **block.input
+            (inject ticker=default when the tool input has no ticker and a default exists); record
+            ToolCallRecord(name, input, output). Final reply = concatenated text blocks. On exception ->
+            HeuristicProvider().chat(...).
+
+      tests/test_anthropic_provider.py: a FakeClient with `messages.parse` returning an object with
+      .parsed_output set from a queue, and `messages.create` returning stubs: first a response with
+      stop_reason "tool_use" and one SimpleNamespace(type="tool_use", id="t1", name="get_move",
+      input={"date":"2025-06-03"}), then stop_reason "end_turn" with a text block. Assert: score_articles maps
+      ids and fills missing ones; explain normalises; suggest_peers upper-cases and drops self; chat calls the
+      fake get_move with ticker injected and returns the text with one ToolCallRecord; when the fake raises,
+      the heuristic fallback answer is returned instead of an exception. No network.
+
+      ACCEPTANCE: uv run pytest -q tests/test_anthropic_provider.py passes; ruff clean.
+
+  - id: T10
+    title: Read queries, filters and JSON dict shapes
+    wave: 2
+    depends_on: [T1]
+    critical_path: false
+    estimate_min: 25
+    owns:
+      - src/stock_moves/queries.py
+      - tests/test_queries.py
+    prompt: |
+      TASK T10 — the read layer shared by the ticker routes (T14) and the chat tools (T13). The dict shapes
+      here are the tool result shapes promised in providers/base.py TOOL_SPECS and the JSON the API returns.
+
+      OWNS: src/stock_moves/queries.py, tests/test_queries.py.
+      USES: stock_moves.models only.
+
+      src/stock_moves/queries.py:
+        @dataclass class MoveFilters: start: date | None = None; end: date | None = None;
+            z_threshold: float = 2.0; pct_threshold: float = 0.02; direction: str | None = None;
+            category: str | None = None; min_relevance: float = 0.0; limit: int = 50
+        def get_company(session, ticker: str) -> Company | None
+        def has_prices(session, ticker: str) -> bool
+        def list_prices(session, ticker, start: date | None = None, end: date | None = None) -> list[Price]   # date asc
+        def list_moves(session, ticker: str, filters: MoveFilters) -> list[Move]
+            # WHERE ticker; date between start/end; (abs(ret_z) >= z_threshold OR abs(ret) >= pct_threshold);
+            # direction if given; category if given: matches Explanation.primary_category when an explanation
+            # row exists for the move, else Move.routing (outer join); ORDER BY abs(ret_z) DESC NULLS LAST,
+            # date DESC; LIMIT. Use sqlmodel select + sqlalchemy func.abs.
+        def get_move(session, ticker: str, on: date) -> Move | None
+        def articles_for_move(session, move_id: int, min_relevance: float = 0.0, limit: int | None = None) -> list[tuple[Article, MoveArticle]]   # relevance desc
+        def get_explanation(session, move_id: int) -> Explanation | None
+        def search_news(session, ticker: str, query: str | None = None, start: date | None = None,
+                        end: date | None = None, min_relevance: float = 0.0, limit: int = 20) -> list[tuple[Article, MoveArticle]]
+            # articles linked to any move of the ticker; title ILIKE %query% when given; published_at window
+            # when given; relevance desc then published_at desc; distinct on article id.
+        def save_chat_message(session, session_id: str, role: str, content: str, tool_calls: list[dict] | None = None) -> ChatMessage
+        def chat_history(session, session_id: str, limit: int = 20) -> list[ChatMessage]   # oldest first
+        Serialisers (plain dicts, dates as ISO strings, floats rounded to 6 places, None passed through):
+        def price_to_dict(p: Price) -> dict
+        def article_to_dict(a: Article, link: MoveArticle | None = None) -> dict
+            # {id, title, source, url, published_at, relevance, category}  (relevance/category None without link)
+        def explanation_to_dict(e: Explanation | None) -> dict | None
+            # {summary, primary_category, confidence, cited_article_ids, unexplained, provider, created_at}
+        def move_to_dict(m: Move, explanation: Explanation | None = None,
+                         articles: Sequence[tuple[Article, MoveArticle]] | None = None) -> dict
+            # {date, ret, ret_z, gap_ret, intraday_ret, vol_z, direction, routing, near_earnings, regime_mkt,
+            #  regime_sector, mkt_component, sector_component, idio_component, peer_comove,
+            #  explanation: dict|None, articles: [article dicts] (key present only when articles is not None)}
+
+      tests/test_queries.py: seed Company "TEST", six Moves across 2025 with mixed direction/ret_z (2.5, -3.1,
+      1.2, -2.2, 0.5 with ret 0.025, 4.0), two with Explanations (primary_category "macro" and "company"),
+      Articles + links with relevances 0.9/0.3. Assert: default filters return the |z|>=2 rows plus the
+      ret>=0.02 row, ordered by |z| desc; direction="down" filters; z_threshold=3 leaves two; category="macro"
+      returns the explained macro move only; category="company" returns the explained company move plus
+      unexplained moves whose routing is company; start/end window; limit; articles_for_move(min_relevance=0.5)
+      -> 1; search_news(query="guidance") matches case-insensitively; chat round-trip save + history order;
+      move_to_dict has every listed key and "articles" only when passed.
+
+      ACCEPTANCE: uv run pytest -q tests/test_queries.py passes; ruff clean.
+
+  - id: T11
+    title: FastAPI skeleton, dependencies, pydantic schemas, static chat page, router stubs
+    wave: 2
+    depends_on: [T1, T2]
+    critical_path: false
+    estimate_min: 30
+    owns:
+      - src/stock_moves/api/__init__.py
+      - src/stock_moves/api/app.py
+      - src/stock_moves/api/deps.py
+      - src/stock_moves/api/schemas.py
+      - src/stock_moves/api/static/index.html
+      - src/stock_moves/api/tickers.py
+      - src/stock_moves/api/chat.py
+      - tests/test_app_smoke.py
+    prompt: |
+      TASK T11 — DESIGN §6 scaffolding so the two route tasks (T13 chat, T14 tickers) can land in parallel.
+      You create api/tickers.py and api/chat.py as STUBS (`router = APIRouter()` and nothing else); T13/T14
+      overwrite them later. Do not put routes in them.
+
+      OWNS: src/stock_moves/api/__init__.py, api/app.py, api/deps.py, api/schemas.py, api/static/index.html,
+      api/tickers.py (stub), api/chat.py (stub), tests/test_app_smoke.py.
+      USES: stock_moves.settings, stock_moves.db, stock_moves.providers.get_provider.
+
+      api/deps.py:
+        def get_db() -> Iterator[Session]                 # yields from stock_moves.db.get_session()
+        def get_provider_dep() -> ModelProvider           # cached per process via functools.lru_cache;
+                                                          # expose `reset_provider_cache()` for tests
+        def get_settings_dep() -> Settings
+      api/schemas.py (pydantic v2 BaseModel, field names exactly matching the dicts in queries.py T10):
+        CompanyOut(ticker, name, sector, industry, sector_etf, peers: list[str], updated_at)
+        PriceOut(date, open, high, low, close, volume, ret, ret_z, gap_ret, intraday_ret, vol_z,
+                 mkt_component, sector_component, idio_component, routing, regime_mkt, regime_sector, near_earnings)
+        ArticleOut(id, title, source, url, published_at, relevance, category)
+        ExplanationOut(summary, primary_category, confidence, cited_article_ids: list[int], unexplained,
+                       provider, created_at)
+        MoveOut(date, ret, ret_z, gap_ret, intraday_ret, vol_z, direction, routing, near_earnings, regime_mkt,
+                regime_sector, mkt_component, sector_component, idio_component, peer_comove,
+                explanation: ExplanationOut | None = None, articles: list[ArticleOut] = [])
+        TickerResponse(ticker, company: CompanyOut | None, ingested: bool, filters: dict, moves: list[MoveOut],
+                       prices: list[PriceOut] | None = None)
+        IngestResponse(ticker, period, top_n, n_prices, n_moves, n_articles, n_explanations, provider, news_source)
+        ChatRequest(message: str, ticker: str | None = None, session_id: str | None = None)
+        ToolCallOut(name, input: dict, output: Any)
+        ChatResponse(reply: str, session_id: str, tool_calls: list[ToolCallOut])
+        All optional numeric fields are `float | None`; dates are `date`/`datetime` and serialise to ISO.
+      api/app.py:
+        def create_app(settings: Settings | None = None) -> FastAPI
+            # title "stock-move-explainer", version from importlib.metadata or "0.1.0"; lifespan calls
+            # init_db(); include_router(tickers.router) and include_router(chat.router) (import the modules,
+            # read `.router`); GET "/" returns FileResponse of api/static/index.html (path via
+            # importlib.resources / Path(__file__).parent); StaticFiles mounted at /static on the same dir.
+        app = create_app()
+      api/static/index.html: one self-contained page, no framework, no external assets. A header, an input
+        for ticker (optional), a message box, a Send button (Enter sends), a transcript that appends user and
+        assistant bubbles, and under each assistant bubble a collapsible <details> listing tool_calls as
+        pretty JSON. JS keeps `sessionId` from the first response and sends it back. POST /chat with
+        {message, ticker, session_id}. Link to /docs. Minimal CSS, readable on a phone.
+      api/__init__.py: empty docstring.
+      tests/test_app_smoke.py: TestClient(create_app()) with the `session` fixture's engine configured
+        (call configure_engine("sqlite://") before create_app); GET / -> 200 and "text/html" and the string
+        "/chat" in the body; GET /docs -> 200; GET /openapi.json -> 200 with "paths".
+
+      ACCEPTANCE: uv run pytest -q tests/test_app_smoke.py passes; ruff clean; `uv run uvicorn
+      stock_moves.api.app:app` starts without error (check by hand, kill it).
+
+  - id: T12
+    title: Ingest orchestration — idempotent, top-N enrichment, on-demand enrichment
+    wave: 3
+    depends_on: [T3, T4, T5, T6, T7, T8, T10]
+    critical_path: true
+    estimate_min: 35
+    owns:
+      - src/stock_moves/ingest.py
+      - tests/test_ingest.py
+    prompt: |
+      TASK T12 — DESIGN §1-§5 wired together. Idempotent on (ticker, date). Explanations for the top-N moves by
+      abs(ret_z) at ingest; any other move is enriched on demand by enrich_move (called by GET .../moves/{date}).
+
+      OWNS: src/stock_moves/ingest.py, tests/test_ingest.py.
+      USES: stock_moves.settings.get_settings; stock_moves.models; stock_moves.prices (call via the module:
+      `prices.fetch_ohlcv`, `prices.fetch_earnings_dates`, `prices.fetch_peer_returns` — never bind them as
+      default args, tests monkeypatch the module attributes); stock_moves.moves (build_features, detect_moves,
+      peer_comove); stock_moves.ontology.get_or_build_company; stock_moves.news (get_news_source,
+      queries_for_move, window_for, NewsItem); stock_moves.scoring (upsert_articles, score_and_link,
+      linked_articles); stock_moves.explain.get_or_create_explanation; stock_moves.providers.get_provider.
+
+      src/stock_moves/ingest.py:
+        @dataclass class IngestResult: ticker: str; period: str; top_n: int; n_prices: int; n_moves: int;
+            n_articles: int; n_explanations: int; provider: str; news_source: str
+        def ingest_ticker(session: Session, ticker: str, *, period: str | None = None, top_n: int | None = None,
+                          z_threshold: float | None = None, pct_threshold: float | None = None,
+                          refresh: bool = False, provider: ModelProvider | None = None,
+                          news_source: NewsSource | None = None) -> IngestResult
+          Steps (None args fall back to get_settings() defaults; provider -> get_provider(); news_source ->
+          get_news_source(settings.news_source, timeout_s=..., throttle_s=...)):
+          1. company = get_or_build_company(session, ticker, provider, refresh=refresh)
+          2. stock = prices.fetch_ohlcv(ticker, period); spy = prices.fetch_ohlcv("SPY", period);
+             etf = prices.fetch_ohlcv(company.sector_etf, period) if company.sector_etf else None (a
+             PriceFetchError on the ETF -> None, on the stock -> re-raise); earnings =
+             prices.fetch_earnings_dates(ticker); peers_ret = prices.fetch_peer_returns(company.peers, period)
+             if company.peers else empty.
+          3. features = build_features(stock, spy, etf, earnings). Upsert Price rows keyed on (ticker, date):
+             update all computed columns for existing rows, insert the rest; NaN -> None. One commit.
+          4. detected = detect_moves(features, z_threshold, pct_threshold); pc = peer_comove(peers_ret,
+             detected.index) if peers else all-None. Upsert Move rows on (ticker, date) with the columns from
+             the features row + direction + peer_comove. Do not delete moves that no longer qualify.
+          5. top = the N moves with largest abs(ret_z) among ALL stored moves for the ticker (re-query the
+             table). For each: enrich_move(..., refresh=refresh).
+          6. Return IngestResult with counts from the table (n_articles = distinct articles linked to this
+             ticker's moves; n_explanations = explanation rows for this ticker's moves).
+        def enrich_move(session: Session, move: Move, company: Company, provider: ModelProvider,
+                        news_source: NewsSource, *, refresh: bool = False, news_limit: int | None = None,
+                        top_k: int | None = None) -> Explanation
+          # If the move already has an Explanation and not refresh -> return it. Else: if the move has no
+          # linked articles or refresh: start, end = window_for(move.date); for (bucket, query) in
+          # queries_for_move(move.routing, company.name, company.ticker, company.peers, company.industry):
+          # items = news_source.search(query, start, end, limit=news_limit) each tagged with
+          # dataclasses.replace(item, bucket=bucket); articles = upsert_articles(session, items);
+          # score_and_link(session, move, company, articles, provider). Then
+          # get_or_create_explanation(session, move, company, provider, top_k=top_k, refresh=refresh).
+          # A news_source exception is caught and logged; the move is still explained (likely `unexplained`).
+        def needs_ingest(session: Session, ticker: str) -> bool     # not has_prices(session, ticker)
+
+      tests/test_ingest.py (no network): monkeypatch stock_moves.prices.fetch_ohlcv with a function returning
+      synthetic_ohlcv(seed=hash(ticker) % 1000, shocks={250: -0.08} if ticker == "TEST" else None) (import
+      `from synth import synthetic_ohlcv`), prices.fetch_info -> TickerInfo("TEST","Test Corp","Technology",
+      "Semiconductors","XLK"), prices.fetch_earnings_dates -> [], prices.fetch_peer_returns -> empty frame;
+      a FakeNewsSource whose search records queries and returns two NewsItems (one title containing "Test
+      Corp"); HeuristicProvider. ingest_ticker(session, "TEST", period="1y", top_n=3): n_prices == number of
+      joined rows, n_moves >= 1, the shock date is a Move, exactly min(3, n_moves) explanations exist, the
+      shock move's explanation cites the "Test Corp" article, FakeNewsSource saw a query starting with
+      '"Test" stock'. Run ingest_ticker again with the same args: row counts identical, no new articles, the
+      news source was not called again. enrich_move on a move outside the top-N creates its explanation.
+      ingest with refresh=True calls the news source again and keeps one explanation per move.
+
+      ACCEPTANCE: uv run pytest -q tests/test_ingest.py passes in under 10 s; ruff clean.
+
+  - id: T13
+    title: POST /chat — tool functions over queries, provider loop, message persistence
+    wave: 3
+    depends_on: [T2, T10, T11]
+    critical_path: false
+    estimate_min: 30
+    owns:
+      - src/stock_moves/api/chat.py
+      - tests/test_chat.py
+    prompt: |
+      TASK T13 — DESIGN §6 `POST /chat`. Overwrite the stub src/stock_moves/api/chat.py (keep the name
+      `router`). Plain JSON, no streaming. Do not touch api/app.py.
+
+      OWNS: src/stock_moves/api/chat.py, tests/test_chat.py.
+      USES: stock_moves.queries (list_moves, MoveFilters, get_move, articles_for_move, get_explanation,
+      search_news, save_chat_message, chat_history, move_to_dict, article_to_dict); stock_moves.providers.base
+      (ChatTurn, ToolFn); stock_moves.api.deps (get_db, get_provider_dep); stock_moves.api.schemas
+      (ChatRequest, ChatResponse, ToolCallOut).
+
+      src/stock_moves/api/chat.py:
+        router = APIRouter(tags=["chat"])
+        def make_tools(session: Session, default_ticker: str | None) -> dict[str, ToolFn]
+          # The three tools named in TOOL_SPECS. Each accepts **kwargs, resolves ticker = (kwargs.get("ticker")
+          # or default_ticker or raise ValueError("ticker required")).upper(), parses date strings with
+          # date.fromisoformat, and returns JSON-serialisable dicts/lists:
+          #   list_moves(ticker?, start?, end?, direction?, limit=10) -> [move_to_dict(m, get_explanation(...))]
+          #       using MoveFilters(z_threshold=0.0, pct_threshold=0.0, ...) so the ordering by |z| does the work
+          #   get_move(ticker?, date) -> move_to_dict(m, explanation, articles_for_move(m.id, limit=10))
+          #       or {"error": f"no move for {ticker} on {date}"}; if the move exists but has no explanation,
+          #       return it as-is (on-demand enrichment is the tickers route's job, not chat's).
+          #   search_news(ticker?, query?, start?, end?, limit=20) -> [article_to_dict(a, link)]
+        @router.post("/chat", response_model=ChatResponse)
+        def chat(req: ChatRequest, session=Depends(get_db), provider=Depends(get_provider_dep)) -> ChatResponse
+          # session_id = req.session_id or uuid4().hex; history = chat_history(session, session_id) as
+          # ChatTurn list (roles user/assistant only) + the new user turn; save the user message;
+          # reply = provider.chat(history, make_tools(session, req.ticker), req.ticker); save the assistant
+          # message with tool_calls as a list of {name, input, output}; return ChatResponse.
+
+      tests/test_chat.py: configure_engine("sqlite://"), init_db, seed Company "TEST" and a Move on
+      2025-06-03 (ret -0.05, ret_z -2.5, routing "company", direction "down") with an Explanation summary
+      "Guidance cut." and one linked Article; ensure the heuristic provider (use the `no_api_key` fixture and
+      call deps.reset_provider_cache()). TestClient(create_app()): POST /chat {"message": "what happened to
+      TEST on 2025-06-03?"} -> 200, reply contains "Guidance cut.", tool_calls[0].name == "get_move",
+      session_id present; second POST with that session_id and message "any news on TEST" -> tool_calls[0]
+      .name == "search_news" and chat_messages now has 4 rows for the session; POST with {"message":
+      "why did it drop", "ticker": "TEST"} -> list_moves called with direction "down".
+
+      ACCEPTANCE: uv run pytest -q tests/test_chat.py passes; ruff clean.
+
+  - id: T14
+    title: Ticker routes — ingest, filtered read, single move with on-demand explanation; end-to-end API test
+    wave: 4
+    depends_on: [T10, T11, T12]
+    critical_path: true
+    estimate_min: 35
+    owns:
+      - src/stock_moves/api/tickers.py
+      - tests/test_api.py
+    prompt: |
+      TASK T14 — DESIGN §5 lazy population and §6 ticker endpoints. Overwrite the stub
+      src/stock_moves/api/tickers.py (keep the name `router`). Do not touch api/app.py.
+
+      OWNS: src/stock_moves/api/tickers.py, tests/test_api.py.
+      USES: stock_moves.ingest (ingest_ticker, enrich_move, needs_ingest); stock_moves.queries (everything);
+      stock_moves.api.deps; stock_moves.api.schemas; stock_moves.settings.
+
+      src/stock_moves/api/tickers.py — router = APIRouter(prefix="/tickers", tags=["tickers"]); tickers are
+      upper-cased; 404 with {"detail": ...} when a ticker has no price data after ingest or a move date has
+      no move; a prices.PriceFetchError during ingest -> 404 "unknown ticker or no price data".
+        @router.post("/{ticker}/ingest", response_model=IngestResponse)
+          query: period: str = settings default; top_n: int = default; z_threshold: float = default;
+          pct_threshold: float = default; refresh: bool = True.   -> ingest_ticker(...) mapped to IngestResponse.
+        @router.get("/{ticker}", response_model=TickerResponse)
+          query: start: date|None; end: date|None; z_threshold: float = default; pct_threshold: float = default;
+          direction: Literal["up","down"]|None; category: Literal["company","industry","macro","unexplained"]|None;
+          min_relevance: float = 0.0; include_prices: bool = False; include_news: bool = True; limit: int = 50;
+          refresh: bool = False; period: str = default; top_n: int = default.
+          If needs_ingest(session, ticker) or refresh: ingest_ticker(session, ticker, period=period,
+          top_n=top_n, z_threshold=z_threshold, pct_threshold=pct_threshold, refresh=refresh); ingested=True.
+          Then moves = list_moves(session, ticker, MoveFilters(...)); for each move attach
+          explanation_to_dict(get_explanation(...)) and, when include_news, articles_for_move(m.id,
+          min_relevance) as article dicts (empty list otherwise); prices = list_prices(session, ticker, start,
+          end) when include_prices else None; filters = the effective query params as a dict. Build the
+          response from dicts (TickerResponse.model_validate).
+        @router.get("/{ticker}/moves/{move_date}", response_model=MoveOut)
+          path move_date: date; query min_relevance: float = 0.0; refresh: bool = False.
+          If needs_ingest -> ingest with defaults. move = get_move(...) or 404. If it has no explanation or
+          refresh: enrich_move(session, move, company, provider, get_news_source(settings.news_source, ...),
+          refresh=refresh). Return move_to_dict(move, explanation, articles_for_move(...)).
+
+      tests/test_api.py — the end-to-end check with zero network:
+        fixture `client`: no_api_key fixture; configure_engine("sqlite://"); deps.reset_provider_cache();
+        monkeypatch stock_moves.prices.fetch_ohlcv (synthetic_ohlcv per ticker, shock {250: -0.08} for
+        "TEST", stable seeds), prices.fetch_info (TickerInfo TEST/Test Corp/Technology/Semiconductors/XLK),
+        prices.fetch_earnings_dates ([]), prices.fetch_peer_returns (empty), and
+        stock_moves.ingest.get_news_source -> a FakeNewsSource returning two items (one mentioning "Test
+        Corp") and counting calls; TestClient(create_app()).
+        Tests: (1) GET /tickers/TEST -> 200, ingested True, company.name "Test Corp", moves non-empty, the shock
+        date is in moves with direction "down", explanation.primary_category == "company" and one cited id,
+        articles non-empty on that move. (2) second GET -> ingested False and the news source call count did
+        not change. (3) GET ?direction=up -> no "down" moves; ?z_threshold=100&pct_threshold=1 -> []; ?
+        include_prices=true -> prices list length > 200 with the DESIGN columns; ?include_news=false ->
+        articles == [] on every move; ?category=company -> every move's explanation category (or routing when
+        unexplained) is company; ?limit=1 -> one move. (4) GET /tickers/TEST/moves/<shock date> -> 200 with
+        explanation; GET for a date with no move -> 404. (5) POST /tickers/TEST/ingest?top_n=1 -> 200 with
+        n_explanations >= 1 and n_prices > 200. (6) GET /tickers/NOPE where fetch_ohlcv raises
+        PriceFetchError -> 404.
+
+      ACCEPTANCE: uv run pytest -q tests/test_api.py passes in under 20 s; the full suite `uv run pytest -q`
+      is green; ruff clean.
+
+  - id: T15
+    title: Integration run on real data, wiring fixes, README run instructions
+    wave: 5
+    depends_on: [T9, T13, T14]
+    critical_path: true
+    estimate_min: 30
+    owns:
+      - README.md
+      - src/stock_moves/__init__.py
+      - .gitignore
+      - data/.gitkeep
+      - "any file, for wiring fixes only (this task runs alone)"
+    prompt: |
+      TASK T15 — integration. You run alone; you may edit any file to fix wiring, but keep fixes minimal and
+      report each one. Network is allowed here (and only here).
+
+      OWNS: README.md, src/stock_moves/__init__.py, .gitignore, data/.gitkeep, plus wiring fixes anywhere.
+
+      1. src/stock_moves/__init__.py: `def main() -> None` runs `uvicorn.run("stock_moves.api.app:app",
+         host="127.0.0.1", port=8000, reload=False)` so `uv run stock-moves` starts the server (pyproject
+         already maps the script). Add `data/*.db` to .gitignore and commit an empty data/.gitkeep.
+      2. Full suite: `uv run ruff check . && uv run ruff format . && uv run pytest -q` must be green.
+      3. Start the server (`uv run stock-moves` in the background) and run, in order, saving outputs:
+           curl -s -X POST 'http://127.0.0.1:8000/tickers/AAPL/ingest?period=1y&top_n=5' | python -m json.tool
+           curl -s 'http://127.0.0.1:8000/tickers/AAPL?direction=down&limit=5' | python -m json.tool | head -80
+           curl -s 'http://127.0.0.1:8000/tickers/AAPL?z_threshold=2.5&include_news=false' | python -m json.tool | head -40
+           curl -s 'http://127.0.0.1:8000/tickers/AAPL/moves/<a date from the first call>' | python -m json.tool
+           curl -s -X POST http://127.0.0.1:8000/chat -H 'content-type: application/json' \
+                -d '{"message":"why did AAPL drop the most this year?","ticker":"AAPL"}' | python -m json.tool
+           curl -s http://127.0.0.1:8000/ | head -5
+         Expected: ingest returns n_prices ~250, n_moves >= 1, n_explanations == min(5, n_moves); the GET
+         returns moves with articles whose titles are real headlines dated within ±1 day of the move; the
+         chat reply names dates. If ANTHROPIC_API_KEY is set in .env the provider field says "anthropic",
+         otherwise "heuristic" — run at least the heuristic path; run the anthropic path too if a key exists.
+         If Google News RSS returns nothing, retry with NEWS_SOURCE=gdelt and note the time it took.
+      4. Fix what breaks (import cycles, wrong keyword names, NaN serialisation, tz issues in dates). Each fix:
+         one sentence in the report saying file + what + why.
+      5. README.md — replace the "Approach" placeholder and extend Setup/Run:
+         - one-paragraph description (from DESIGN §0), zero keys required, optional ANTHROPIC_API_KEY and
+           NEWS_SOURCE in .env (give a .env example);
+         - `uv sync`, `uv run stock-moves`, open http://127.0.0.1:8000/ (chat) and /docs (Swagger);
+         - the six curls above with a trimmed real response excerpt for the first two;
+         - how thresholds work (ingest-time thresholds decide which days become moves; GET thresholds filter;
+           re-ingest with lower thresholds to see more);
+         - `uv run pytest -q` and what the tests cover (no network);
+         - a "Design" line pointing at DESIGN.md, docs/architecture-v1.md, docs/architecture-v2.md;
+         - a "Limitations" list copied from docs/architecture-v1.md's Known limitations.
+      6. Stop the server. Report: files changed, the curl outputs (trimmed), timings for ingest with each
+         news source you tried, and anything that is still wrong.
+
+      ACCEPTANCE: the six curls return the shapes above against live data; full pytest green; README has run
+      instructions a stranger can follow.
+
+  - id: T16
+    title: Submission write-up (four questions)
+    wave: 6
+    depends_on: [T15]
+    critical_path: true
+    estimate_min: 15
+    owns:
+      - docs/WRITEUP.md
+    prompt: |
+      TASK T16 — docs/WRITEUP.md, the short written part of the submission. Brief: the whole file under 120
+      lines, plain English, no marketing. Base every claim on what was actually built and on T15's report
+      (ask the coordinator for it if it is not in your context); do not describe features that did not land.
+
+      OWNS: docs/WRITEUP.md.
+
+      Structure: a two-sentence summary of the system, then one section per submission question, each 6-15
+      lines, using the question's exact wording as the heading. The four questions are appended below under
+      `--- QUESTIONS ---`. If that section is empty, use these four headings, which cover what such prompts
+      ask, and flag at the top of the file that the headings are provisional:
+        1. How does the system decide what a "major" move is, and why?  (DESIGN §1: z-score of returns over a
+           trailing 20-day window, pct threshold kept as a parameter; both are query filters.)
+        2. How does it explain a move, and how do you keep it honest?  (DESIGN §0/§4: decomposition routes the
+           news query; grounded retrieval in a ±1 day window; structured output with citations, confidence
+           and an explicit `unexplained`; attribution not causation.)
+        3. What would you change with more time or in production?  (DESIGN §7 and docs/architecture-v2.md:
+           paid full-text news, own classifier trained on move_articles labels, calibration against a labeled
+           set, scheduled ingest, multi-day windows, deployment.)
+        4. How did you use AI tools, and how did you verify the result?  (the DESIGN-first workflow, a task
+           DAG run by parallel agents, tests with synthetic prices and no network, the live AAPL run in T15.)
+      End with a "Known limitations" list of at most 8 bullets taken from docs/architecture-v1.md.
+
+      --- QUESTIONS ---
+
+      ACCEPTANCE: file exists, under 120 lines, every heading is a question, no claim contradicts README or
+      the T15 report.

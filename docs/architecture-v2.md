@@ -2,7 +2,7 @@
 
 ## What changes and what does not
 
-The core pipeline and the API contract stay the same: prices → move detection → decomposition and routing → news fetch → scoring → explanation, exposed as `GET /tickers/{ticker}`, `GET /tickers/{ticker}/moves/{date}`, `POST /chat`, and the same JSON shapes. `ModelProvider` stays as the seam. What changes is everything around that seam. Ingest moves from lazy-on-request to scheduled and incremental, with a queue between fetch and scoring. SQLite becomes RDS Postgres with pgvector, and raw article bodies go to S3. GDELT becomes the fallback behind a paid news provider with full text. The LLM stops scoring articles; a fine-tuned relevance and category classifier, trained on the labels v1 accumulated in `move_articles`, does that, and the LLM writes only the prose. The company ontology becomes a knowledge graph, in Postgres first. Keys live in Secrets Manager, logs and metrics in CloudWatch, and the chat page is a small static UI on S3 + CloudFront.
+The core pipeline and the API contract stay the same: prices → move detection → decomposition and routing → news fetch → scoring → explanation, exposed as `GET /tickers/{ticker}`, `GET /tickers/{ticker}/moves/{date}`, `POST /chat`, and the same JSON shapes. `ModelProvider` stays as the seam. What changes is everything around that seam. Ingest moves from lazy-on-request to scheduled and incremental, with a queue between fetch and scoring. SQLite becomes RDS Postgres with pgvector, and raw article bodies go to S3. A paid full-text provider (Exa) becomes the primary `NewsSource` implementation; `GoogleNewsRSS` and `GDELTSource` stay behind the same protocol as fallbacks. The LLM stops scoring articles; a fine-tuned relevance and category classifier, trained on the labels v1 accumulated in `move_articles`, does that, and the LLM writes only the prose. The company ontology becomes a knowledge graph, in Postgres first. Keys live in Secrets Manager, logs and metrics in CloudWatch, and the chat page is a small static UI on S3 + CloudFront.
 
 ## Component diagram
 
@@ -43,13 +43,17 @@ flowchart TB
 
   subgraph sources["Sources"]
     PX["Price feed: yfinance or paid EOD"]
-    NEWS["Paid news: Exa or NewsAPI, full text"]
-    GD["GDELT: fallback, titles only"]
+    subgraph ns["NewsSource protocol"]
+      NEWS["Exa or NewsAPI, primary: full text, real urls"]
+      GN["GoogleNewsRSS, fallback: titles only, redirect urls"]
+      GD["GDELTSource, fallback: titles only, 5 s throttle"]
+    end
     KG["Neptune: only when traversals need it"]
   end
 
   PX --> FETCH
   NEWS --> FETCH
+  GN -.->|"fallback"| FETCH
   GD -.->|"fallback"| FETCH
   FETCH --> S3RAW
   FETCH --> PG
@@ -78,7 +82,7 @@ sequenceDiagram
   participant F as Fetch task
   participant PG as Postgres
   participant PX as Price feed
-  participant N as News provider
+  participant N as NewsSource (Exa primary)
   participant S3 as S3 raw
   participant Q as SQS
   participant W as Score worker
@@ -153,7 +157,7 @@ The point: a user who reads "unexplained" should be able to trust that the syste
 | SQLite `data/app.db` | RDS Postgres + pgvector | Concurrent writers, backups, embeddings in the same store as the join |
 | No article body | S3 raw bodies, keyed by content hash | Full text for scoring and for re-labeling later; cheap to keep forever |
 | URL dedupe | URL plus embedding cosine dedupe | Syndicated copies collapse; cross-ticker retrieval comes free |
-| GDELT only | Exa or NewsAPI primary, GDELT fallback | Full text and better recall; GDELT keeps history and zero-key resilience |
+| `GoogleNewsRSS` primary, `GDELTSource` fallback, titles only | Exa primary as a third `NewsSource` implementation, RSS and GDELT kept as fallbacks | Full text, real urls instead of Google redirects, no 5 s throttle; the free sources keep zero-key resilience |
 | `AnthropicProvider.score()` | Fine-tuned classifier on SageMaker or Fargate | Per-article scoring is the volume cost; a small encoder is cheaper and more consistent |
 | `AnthropicProvider.explain()` | Bedrock or Anthropic API, prose only | One call per move, low volume; keep the model that writes well |
 | `companies.peers_json` | `company_edges` adjacency in Postgres, Neptune later | Typed relations (peer, supplier, customer) as a table; graph DB only when traversals demand it |
@@ -169,7 +173,7 @@ Build first, in order:
 
 1. **Postgres + Fargate API.** Same code, `DATABASE_URL` swap. Unblocks everything else.
 2. **Scheduled incremental ingest with SQS.** The single biggest behaviour change; makes the system fresh and bounded in cost.
-3. **Paid news with bodies to S3.** Better inputs beat better models; bodies also make the labeling work below possible.
+3. **Paid news with bodies to S3.** One more `NewsSource` implementation, no pipeline change. Better inputs beat better models; bodies also make the labeling work below possible.
 4. **Hand-labeled move set and calibration.** ~200 moves is a few days of labeling and it makes every confidence number meaningful. Do this before the classifier so the classifier has a gold eval.
 5. **Classifier replacing LLM scoring.** Only once the silver set is large enough (tens of thousands of pairs) and gold eval exists.
 

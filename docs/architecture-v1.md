@@ -2,7 +2,7 @@
 
 ## Summary
 
-v1 is a single FastAPI process backed by SQLite that explains major daily stock moves with news. For a ticker it pulls daily OHLCV from `yfinance` (ticker, `SPY`, sector ETF), flags "major" days by a rolling z-score of returns, decomposes each move into market / sector / idiosyncratic components with a trailing OLS, and uses that decomposition to route a news query to GDELT (company, industry, or macro vocabulary) in a ±1 day window. A `ModelProvider` scores each article for relevance and category and writes a structured explanation with citations and a confidence; the `AnthropicProvider` is used when `ANTHROPIC_API_KEY` is set, otherwise a `HeuristicProvider` runs on keyword rules and the numbers. Everything is cached in SQLite, populated lazily on the first `GET /tickers/{ticker}`. A `POST /chat` endpoint runs a tool-calling loop over the same read functions, and a static HTML page plus Swagger sit on top. The app runs with zero API keys.
+v1 is a single FastAPI process backed by SQLite that explains major daily stock moves with news. For a ticker it pulls daily OHLCV from `yfinance` (ticker, `SPY`, sector ETF), flags "major" days by a rolling z-score of returns, decomposes each move into market / sector / idiosyncratic components with a trailing OLS, and uses that decomposition to route a news query (company, industry, or macro vocabulary) in a ±1 day window through a `NewsSource` protocol; `GoogleNewsRSS` is the primary source and `GDELTSource` the fallback. A `ModelProvider` scores each article for relevance and category and writes a structured explanation with citations and a confidence; the `AnthropicProvider` is used when `ANTHROPIC_API_KEY` is set, otherwise a `HeuristicProvider` runs on keyword rules and the numbers. Everything is cached in SQLite, populated lazily on the first `GET /tickers/{ticker}`. A `POST /chat` endpoint runs a tool-calling loop over the same read functions, and a static HTML page plus Swagger sit on top. The app runs with zero API keys.
 
 ## Component diagram
 
@@ -10,7 +10,11 @@ v1 is a single FastAPI process backed by SQLite that explains major daily stock 
 flowchart LR
   subgraph ext["External, free and keyless"]
     YF["yfinance: OHLCV, info, earnings dates"]
-    GD["GDELT DOC 2.0 API: title, url, source, date"]
+  end
+
+  subgraph news["NewsSource protocol: search(query, start, end, limit)"]
+    GN["GoogleNewsRSS, primary: title, source, url, date"]
+    GD["GDELTSource, fallback: 5 s client-side throttle"]
   end
 
   subgraph model["ModelProvider interface"]
@@ -22,7 +26,7 @@ flowchart LR
     P1["1. Fetch prices: ticker, SPY, sector ETF"]
     P2["2. Move detection: ret_z, ret, vol_z"]
     P3["3. Decomposition and routing: OLS on SPY and ETF"]
-    P4["4. News fetch: one GDELT query per routing bucket"]
+    P4["4. News fetch: one NewsSource query per routing bucket"]
     P5["5. Scoring: relevance 0-1, category"]
     P6["6. Explanation: top-N moves by abs ret_z"]
     P1 --> P2 --> P3 --> P4 --> P5 --> P6
@@ -49,7 +53,7 @@ flowchart LR
 
   YF --> P1
   YF -->|"sector, name, earnings"| P3
-  GD --> P4
+  news --> P4
   model --> P5
   model --> P6
   P1 --> T2
@@ -78,7 +82,7 @@ sequenceDiagram
   participant DB as SQLite
   participant I as Ingest pipeline
   participant Y as yfinance
-  participant G as GDELT
+  participant N as NewsSource (GoogleNewsRSS)
   participant M as ModelProvider
 
   Note over C,M: First call (no rows for ticker) or refresh=true
@@ -91,8 +95,8 @@ sequenceDiagram
   I->>I: compute ret, ret_z, vol_z, OLS components, routing, regimes
   I->>DB: upsert companies, prices, moves on (ticker, date)
   loop each move
-    I->>G: query for routing bucket, date +/- 1 day
-    G-->>I: titles, urls, sources
+    I->>N: search(bucket query anchored with "stock", date +/- 1 day)
+    N-->>I: titles, sources, redirect urls, dates
     I->>DB: insert articles (dedupe on url)
     I->>M: score articles (relevance, category)
     M-->>I: scores
@@ -201,9 +205,11 @@ A row exists for any day with `abs(ret_z) >= 2.0` or `abs(ret) >= 0.02` at inges
 | column | type | notes |
 |---|---|---|
 | `id` | int | pk |
-| `url` | text | **unique**; dedupe key |
-| `title`, `source`, `language` | text | from GDELT |
-| `published_at` | datetime | from GDELT `seendate` |
+| `url` | text | **unique**; dedupe key (a Google redirect URL for RSS items) |
+| `title`, `source` | text | headline and outlet name |
+| `language` | text | nullable; GDELT sets it, RSS does not |
+| `published_at` | datetime | item date from the source |
+| `news_source` | text | `google_news_rss` or `gdelt` |
 | `fetched_at` | datetime | |
 
 ### `move_articles`
@@ -214,7 +220,7 @@ A row exists for any day with `abs(ret_z) >= 2.0` or `abs(ret) >= 0.02` at inges
 | `article_id` | int | fk `articles.id` |
 | `relevance` | real | 0–1 from the provider |
 | `category` | text | `company`, `industry`, or `macro` |
-| `query_bucket` | text | which routing query returned it |
+| `provider` | text | `anthropic` or `heuristic`; v2 trains only on `anthropic` rows |
 
 ### `explanations`
 
@@ -245,7 +251,9 @@ A row exists for any day with `abs(ret_z) >= 2.0` or `abs(ret) >= 0.02` at inges
 
 - **z-score over a fixed 2%.** 2% is a big day for KO and a quiet day for a small cap. `ret_z` normalises by the ticker's own recent volatility, so "major" means the same thing across tickers. `pct_threshold` stays as a query param because the prompt suggests it, but z is the definition.
 - **Decomposition as routing, not as the answer.** The OLS split into market / sector / idiosyncratic is not causal. It is used to pick which news query to run, so the model reads company news for company moves and macro news for macro moves. Peer co-movement is the second, independent industry signal.
-- **GDELT because it is keyless and historical.** It covers 2015 onward with date filters and needs no signup, so the app runs on a fresh machine. The cost: titles only, no article body, and noisy source quality. Scoring is on the headline.
+- **A `NewsSource` protocol with Google News RSS as primary.** Probed with no keys on 2026-09-15: one query returns 100 dated, sourced items, `after:`/`before:` operators give a historical date window, outlets are mainstream, and there is no throttle. The cost: title, source, url and date only, no body, and the url is a Google redirect, so URL dedupe is on the redirect and the body cannot be fetched from it later. Scoring is on the headline.
+- **GDELT DOC 2.0 as the second implementation.** Also keyless and historical since 2015, and it adds a language field. The cost: one request per five seconds, enforced client-side, so a one-year ingest with ~25 moves and one query each takes about two minutes on GDELT versus seconds on RSS. It is the fallback, or the primary when `NEWS_SOURCE=gdelt`.
+- **Queries anchored to the market.** The company query is `"<name>" stock` plus the ticker, not the bare name, so a common name does not return obituaries and sports.
 - **SQLite, no vector DB.** The join between a move and its news is a date window (±1 day), not a semantic match. A `WHERE published_at BETWEEN` on one file is the whole retrieval. A vector store would add a dependency and nothing to recall in v1.
 - **Provider interface so the app runs with zero keys.** `ModelProvider` has two implementations behind one signature. The heuristic path is not a stub; it produces relevance, category, and a templated explanation from the same inputs, so every endpoint and test works offline.
 - **Top-N explanation as the cost control.** Only the N largest moves by `abs(ret_z)` get an LLM explanation on ingest. Any other move is explained on first request and cached. Token spend scales with N, not with the number of moves.
@@ -254,7 +262,8 @@ A row exists for any day with `abs(ret_z) >= 2.0` or `abs(ret) >= 0.02` at inges
 ## Known limitations
 
 - Attribution, not causation: the explanation says what the news said on the day, not what moved the price.
-- GDELT gives headlines only; scoring cannot see article bodies. Coverage of small caps is thin.
+- Both news sources give headlines only; scoring cannot see article bodies. Coverage of small caps is thin.
+- RSS urls are Google redirects, so the same story reached through two redirect urls is stored twice; GDELT is throttled to one request per five seconds.
 - The 60-day OLS is a rough factor model; betas are noisy on volatile names and near regime changes.
 - Sector ETF mapping is a static dict; conglomerates and misclassified `yfinance` sectors route badly.
 - Peers come from one LLM call and are empty without a key, so peer co-movement is missing in heuristic mode.
