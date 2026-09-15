@@ -35,6 +35,7 @@ filters, not code constants):
 | `routing` | `company` if abs(idio) dominates, `industry` if sector dominates, `macro` if market dominates |
 | `regime_mkt`, `regime_sector` | `bull`/`bear` from 50 vs 200 day SMA of SPY / sector ETF on that date |
 | `near_earnings` | true if within ±1 trading day of a `yfinance` earnings date |
+| `near_fomc`, `near_cpi` | true if within ±1 trading day of a Fed decision or CPI release, from a hardcoded 2025–2026 calendar (the macro equivalent of the earnings flag) |
 
 A **move** is a day with `abs(ret_z) >= z_threshold` (default 2.0) OR
 `abs(ret) >= pct_threshold` (default 0.02, kept configurable because the prompt
@@ -47,7 +48,7 @@ network.
 
 Table `companies(ticker, name, sector, industry, sector_etf, peers_json,
 updated_at)`. Name/sector/industry from `yfinance`; `peers` from one cached LLM
-call (fallback: empty list). Peers give a **second, data-driven industry
+call; keyless fallback: the top holdings of the sector ETF via `yfinance`. Peers give a **second, data-driven industry
 signal**: same-day co-movement of peer prices. If AMD and NVDA both fell 5%, the
 move is industry before any article is read.
 

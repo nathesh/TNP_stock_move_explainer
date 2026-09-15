@@ -29,6 +29,8 @@ tasks:
       - tests/conftest.py
       - tests/test_models.py
     prompt: |
+      DECISION ADDED 2026-09-15: prices/moves gain boolean columns near_fomc and near_cpi; companies gains peers_source text.
+
       DECISION ADDED 2026-09-15 (docs/architecture-v1.md, move_articles): store the five heuristic components (bucket_match, entity_match, timing, source_tier, coverage), timing_kind ('cause' or 'report') and a nullable model_score on move_articles; relevance is the weighted sum (0.35/0.20/0.15/0.15/0.15), or the mean of that and model_score when a key is present.
 
       TASK T1 — settings, engine, tables. Everything downstream imports from these three modules, so the names
@@ -227,6 +229,8 @@ tasks:
       - tests/synth.py
       - tests/test_moves.py
     prompt: |
+      DECISION ADDED 2026-09-15: add a hardcoded macro event calendar for 2025 and 2026 — FOMC decision dates and CPI release dates as two date lists in moves.py (or a small macro_calendar.py you also own) — and two boolean columns near_fomc and near_cpi (within ±1 trading day), computed the same way as near_earnings. Use the published Federal Reserve FOMC schedule and BLS CPI schedule; if unsure of a date, leave it out rather than guess.
+
       TASK T3 — DESIGN §1 as pure functions over pandas DataFrames. No I/O, no imports from other stock_moves
       modules. Every function takes/returns frames indexed by a tz-naive DatetimeIndex named "date", sorted
       ascending, with lower-case columns open, high, low, close, volume.
@@ -438,6 +442,8 @@ tasks:
       - src/stock_moves/ontology.py
       - tests/test_ontology.py
     prompt: |
+      DECISION ADDED 2026-09-15: keyless peers fallback — when no model key is present (or the model call fails), derive peers from the sector ETF's top holdings via yfinance (Ticker(sector_etf).funds_data.top_holdings, take up to 8 symbols excluding the ticker itself); store peers_source='model' or 'etf_holdings' on companies. Verify the yfinance attribute exists with one manual call; if it does not, fall back to an empty list and say so in your report.
+
       TASK T6 — DESIGN §2. The companies row: name/sector/industry/sector_etf from yfinance, peers from one
       provider call (heuristic returns []).
 
