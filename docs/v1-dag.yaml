@@ -472,6 +472,8 @@ tasks:
       - src/stock_moves/scoring.py
       - tests/test_scoring.py
     prompt: |
+      DECISION ADDED 2026-09-15 (DESIGN.md section 4): the heuristic scorer runs on every headline and keeps the top-K per move (K from settings, default 15); when a key is present the Anthropic provider re-scores only those K and the stored relevance is the mean of heuristic and model scores; store the heuristic components so they are inspectable.
+
       TASK T7 — DESIGN §3 storage and §4 scoring: articles are stored once (dedupe on URL) and linked to
       moves through move_articles with relevance and category from the provider.
 
@@ -516,6 +518,8 @@ tasks:
       - src/stock_moves/explain.py
       - tests/test_explain.py
     prompt: |
+      DECISION ADDED 2026-09-15 (DESIGN.md section 4): the explanation prompt receives only the top-K articles already selected by scoring; one model call per move; model id comes from settings and defaults to claude-sonnet-5.
+
       TASK T8 — DESIGN §4 explanation: build the context, call the provider, cache one row per move.
 
       OWNS: src/stock_moves/explain.py, tests/test_explain.py.
@@ -741,6 +745,8 @@ tasks:
       - src/stock_moves/ingest.py
       - tests/test_ingest.py
     prompt: |
+      DECISION ADDED 2026-09-15 (DESIGN.md section 5): implement the freshness rule — on ingest, if the newest stored price date is older than the last completed trading day, fetch and process only the gap; expose is_stale(ticker) -> bool for the API to call on every read; guard ingest with a per-ticker threading.Lock held in a module-level dict; refresh=True forces a full re-run, still idempotent.
+
       TASK T12 — DESIGN §1-§5 wired together. Idempotent on (ticker, date). Explanations for the top-N moves by
       abs(ret_z) at ingest; any other move is enriched on demand by enrich_move (called by GET .../moves/{date}).
 

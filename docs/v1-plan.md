@@ -173,3 +173,9 @@ flowchart LR
 The four submission questions are not in this repo (the prompt arrives with the take-home).
 The coordinator appends them verbatim to T16's prompt under `--- QUESTIONS ---` before handing
 it out; T16's prompt says what to do if that section is empty.
+
+## Decisions added after the plan was written (2026-09-15, see DESIGN.md)
+
+- Providers are combined: heuristic pre-filter on every headline, model on the top-K and the explanation only. Model default `claude-sonnet-5`. Affects T7, T8.
+- Freshness rule: on read, ingest the gap if the newest stored price is older than the last completed trading day; per-ticker lock. Affects T12, T14.
+- Hugging Face classifier, implied volatility and learned cross-ticker relationships are v2.
