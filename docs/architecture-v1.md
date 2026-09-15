@@ -169,7 +169,8 @@ All tables are SQLModel classes in SQLite. `id` is an autoincrement integer unle
 | `name` | text | from `yfinance` `info` |
 | `sector`, `industry` | text | from `yfinance` `info` |
 | `sector_etf` | text | static dict sector → XLK/XLF/XLE/... |
-| `peers_json` | text | list of peer tickers from one cached LLM call; `[]` without a key |
+| `peers_json` | text | list of peer tickers from one cached LLM call; without a key, the top holdings of the sector ETF |
+| `peers_source` | text | which path produced `peers_json`: `model`, `etf_holdings`, or null when neither returned peers |
 | `updated_at` | datetime | |
 
 ### `prices`
@@ -273,7 +274,7 @@ A row exists for any day with `abs(ret_z) >= 2.0` or `abs(ret) >= 0.02` at inges
 - RSS urls are Google redirects, so the same story reached through two redirect urls is stored twice; GDELT is throttled to one request per five seconds.
 - The 60-day OLS is a rough factor model; betas are noisy on volatile names and near regime changes.
 - Sector ETF mapping is a static dict; conglomerates and misclassified `yfinance` sectors route badly.
-- Peers come from one LLM call and are empty without a key, so peer co-movement is missing in heuristic mode.
+- Without a model key, peers are the sector ETF's top holdings rather than true competitors, so peer co-movement is a sector proxy.
 - Confidence is uncalibrated; `unexplained` reflects the model's opinion, not a measured error rate.
 - No scheduled ingest; data goes stale until `?refresh=true`.
 - Single-day moves only; multi-day drifts and gap-then-reversal patterns are not modeled.

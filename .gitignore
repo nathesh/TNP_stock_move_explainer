@@ -11,3 +11,7 @@ wheels/
 .env
 .pytest_cache/
 .ruff_cache/
+
+# Local SQLite databases (data/.gitkeep is tracked)
+data/*.db
+data/*.db-journal

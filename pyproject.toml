@@ -35,3 +35,9 @@ dev = [
 
 [tool.uv.build-backend]
 module-name = "stock_moves"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+extend-select = ["I", "UP", "B", "SIM", "DTZ", "BLE"]

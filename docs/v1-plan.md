@@ -152,7 +152,7 @@ flowchart LR
 
 ## How an agent should execute a task
 
-1. Read `/Users/thejasprasad/Documents/tetrix-take-home/DESIGN.md` in full, then
+1. Read `<repo root>/DESIGN.md` in full, then
    `docs/architecture-v1.md` if the task touches tables or endpoints, then the task prompt from
    `docs/v1-dag.yaml`. Do not change DESIGN.md or this plan.
 2. Touch only the files listed under `owns`. If you believe another file must change, do not

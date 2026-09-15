@@ -1,12 +1,12 @@
 # v1 task DAG for stock-move-explainer. Human twin: docs/v1-plan.md.
 # Each `prompt` is handed to one coding agent verbatim. Common preamble for every agent:
-#   - Work only in /Users/thejasprasad/Documents/tetrix-take-home. Read DESIGN.md first; it is the source
+#   - Work only in <repo root>. Read DESIGN.md first; it is the source
 #     of truth and must not be changed. docs/architecture-v1.md holds the table columns.
 #   - Package: src/stock_moves (Python 3.12, uv). Touch only the files in `owns`. No new dependencies.
 #   - Before reporting run: uv run ruff check . && uv run ruff format . && uv run pytest -q
 #   - No network calls inside pytest. Report the exact files changed and the public names exposed.
 common_preamble: |
-  You are implementing one task of a 4-hour Python take-home. Repo: /Users/thejasprasad/Documents/tetrix-take-home
+  You are implementing one task of a 4-hour Python take-home. Repo: <repo root>
   (package src/stock_moves, Python 3.12, uv, pytest, ruff). First read DESIGN.md completely; it is the source of
   truth and you must not change it. docs/architecture-v1.md has the exact table columns. Then do the task below.
   Rules: touch only the files listed under OWNS; add no dependencies; type-hint everything; never call the

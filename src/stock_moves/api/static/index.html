@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Stock move explainer</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --fg: #16181d;
+    --muted: #5f6672;
+    --line: #dfe3ea;
+    --user: #e8effb;
+    --bot: #f4f5f7;
+    --accent: #1f5fd0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a;
+      --fg: #e9ebef;
+      --muted: #9aa3b0;
+      --line: #2c3038;
+      --user: #1d2d47;
+      --bot: #1e2126;
+      --accent: #7aa7f0;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 740px; margin: 0 auto; padding: 16px; }
+  header { border-bottom: 1px solid var(--line); padding-bottom: 12px; margin-bottom: 16px; }
+  h1 { font-size: 1.15rem; margin: 0 0 4px; }
+  header p { margin: 0; color: var(--muted); font-size: 0.85rem; }
+  header a { color: var(--accent); }
+  #transcript { display: flex; flex-direction: column; gap: 12px; min-height: 120px; }
+  .turn { display: flex; flex-direction: column; gap: 6px; }
+  .turn.user { align-items: flex-end; }
+  .bubble {
+    max-width: 88%;
+    padding: 10px 12px;
+    border-radius: 12px;
+    background: var(--bot);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .turn.user .bubble { background: var(--user); }
+  .role { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+  details { max-width: 88%; font-size: 0.85rem; }
+  summary { cursor: pointer; color: var(--muted); }
+  pre {
+    margin: 8px 0 0;
+    padding: 10px;
+    background: var(--bot);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    overflow-x: auto;
+    font-size: 0.78rem;
+  }
+  form { margin-top: 20px; display: flex; flex-direction: column; gap: 8px; }
+  .row { display: flex; gap: 8px; }
+  .row input[type="text"] { flex: 1 1 auto; min-width: 0; }
+  input, textarea, button {
+    font: inherit;
+    color: inherit;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 9px 10px;
+  }
+  #ticker { text-transform: uppercase; max-width: 8.5rem; }
+  textarea { resize: vertical; min-height: 68px; }
+  button {
+    background: var(--accent);
+    color: #fff;
+    border-color: transparent;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button[disabled] { opacity: 0.55; cursor: default; }
+  .hint { color: var(--muted); font-size: 0.78rem; }
+  .err { color: #c0392b; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Stock move explainer</h1>
+    <p>
+      Ask why a stock moved. Answers come from stored moves, their news and their
+      decomposition &mdash; see the API at <a href="/docs">/docs</a>.
+    </p>
+  </header>
+
+  <div id="transcript" aria-live="polite"></div>
+
+  <form id="composer" autocomplete="off">
+    <div class="row">
+      <input id="ticker" type="text" placeholder="TICKER" aria-label="Ticker (optional)" />
+      <input id="session" type="text" readonly tabindex="-1" placeholder="session id" aria-label="Session id" />
+    </div>
+    <textarea id="message" placeholder="Why did NVDA drop on 2025-01-27?" aria-label="Message"></textarea>
+    <div class="row">
+      <button id="send" type="submit">Send</button>
+    </div>
+    <p class="hint">Enter sends, Shift+Enter adds a newline. Ticker is optional.</p>
+  </form>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var transcript = document.getElementById("transcript");
+  var form = document.getElementById("composer");
+  var messageBox = document.getElementById("message");
+  var tickerBox = document.getElementById("ticker");
+  var sessionBox = document.getElementById("session");
+  var sendButton = document.getElementById("send");
+  var sessionId = null;
+  var busy = false;
+
+  function addTurn(role, text, cssClass) {
+    var turn = document.createElement("div");
+    turn.className = "turn " + role;
+
+    var label = document.createElement("div");
+    label.className = "role";
+    label.textContent = role === "user" ? "you" : "assistant";
+    turn.appendChild(label);
+
+    var bubble = document.createElement("div");
+    bubble.className = "bubble" + (cssClass ? " " + cssClass : "");
+    bubble.textContent = text;
+    turn.appendChild(bubble);
+
+    transcript.appendChild(turn);
+    turn.scrollIntoView({ block: "end" });
+    return turn;
+  }
+
+  function addToolCalls(turn, toolCalls) {
+    if (!toolCalls || !toolCalls.length) {
+      return;
+    }
+    var details = document.createElement("details");
+    var summary = document.createElement("summary");
+    summary.textContent =
+      toolCalls.length + (toolCalls.length === 1 ? " tool call" : " tool calls");
+    details.appendChild(summary);
+
+    var pre = document.createElement("pre");
+    pre.textContent = JSON.stringify(toolCalls, null, 2);
+    details.appendChild(pre);
+
+    turn.appendChild(details);
+  }
+
+  function setBusy(value) {
+    busy = value;
+    sendButton.disabled = value;
+    sendButton.textContent = value ? "Sending…" : "Send";
+  }
+
+  async function send() {
+    var message = messageBox.value.trim();
+    if (!message || busy) {
+      return;
+    }
+    var ticker = tickerBox.value.trim().toUpperCase();
+
+    addTurn("user", message);
+    messageBox.value = "";
+    setBusy(true);
+
+    var pending = addTurn("assistant", "…");
+    try {
+      var response = await fetch("/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: message,
+          ticker: ticker || null,
+          session_id: sessionId
+        })
+      });
+      var body = await response.json();
+      if (!response.ok) {
+        throw new Error(body && body.detail ? JSON.stringify(body.detail) : "HTTP " + response.status);
+      }
+      if (body.session_id) {
+        sessionId = body.session_id;
+        sessionBox.value = sessionId;
+      }
+      pending.querySelector(".bubble").textContent = body.reply || "(no reply)";
+      addToolCalls(pending, body.tool_calls);
+    } catch (error) {
+      var bubble = pending.querySelector(".bubble");
+      bubble.className = "bubble err";
+      bubble.textContent = "Request failed: " + error.message;
+    } finally {
+      setBusy(false);
+      messageBox.focus();
+    }
+  }
+
+  form.addEventListener("submit", function (event) {
+    event.preventDefault();
+    send();
+  });
+
+  messageBox.addEventListener("keydown", function (event) {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      send();
+    }
+  });
+
+  messageBox.focus();
+})();
+</script>
+</body>
+</html>

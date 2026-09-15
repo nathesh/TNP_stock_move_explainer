@@ -1,0 +1,378 @@
+"""Tests for stock_moves.prices. No network: `yfinance` is monkeypatched."""
+
+from __future__ import annotations
+
+from datetime import date
+from typing import Any
+
+import pandas as pd
+import pytest
+
+from stock_moves import prices
+from stock_moves.prices import (
+    MARKET_ETF,
+    SECTOR_ETF,
+    PriceFetchError,
+    TickerInfo,
+    fetch_earnings_dates,
+    fetch_etf_holdings,
+    fetch_info,
+    fetch_ohlcv,
+    fetch_peer_returns,
+    normalize_ohlcv,
+    sector_etf_for,
+)
+
+TZ = "America/New_York"
+
+
+def _raw_history() -> pd.DataFrame:
+    """A yfinance-shaped history frame: tz-aware index, capitalised columns,
+    a duplicate date (2026-01-06 twice) and a NaN close (2026-01-07)."""
+    index = pd.DatetimeIndex(
+        [
+            "2026-01-05 00:00:00",
+            "2026-01-06 00:00:00",
+            "2026-01-06 00:00:00",
+            "2026-01-07 00:00:00",
+            "2026-01-02 00:00:00",
+        ],
+        name="Date",
+    ).tz_localize(TZ)
+    return pd.DataFrame(
+        {
+            "Open": [10.0, 11.0, 11.5, 12.0, 9.0],
+            "High": [10.5, 11.8, 11.9, 12.5, 9.4],
+            "Low": [9.8, 10.9, 11.4, 11.8, 8.9],
+            "Close": [10.2, 11.1, 11.7, float("nan"), 9.1],
+            "Volume": [1000, 2000, 2500, 3000, 500],
+            "Dividends": [0.0, 0.0, 0.0, 0.0, 0.0],
+            "Stock Splits": [0.0, 0.0, 0.0, 0.0, 0.0],
+        },
+        index=index,
+    )
+
+
+def test_normalize_ohlcv_shape_and_index() -> None:
+    frame = normalize_ohlcv(_raw_history())
+
+    assert list(frame.columns) == ["open", "high", "low", "close", "volume"]
+    assert frame.index.name == "date"
+    assert frame.index.tz is None
+    assert list(frame.index) == [
+        pd.Timestamp("2026-01-02"),
+        pd.Timestamp("2026-01-05"),
+        pd.Timestamp("2026-01-06"),
+    ]
+    assert frame.index.is_monotonic_increasing
+    # all bars sit at midnight
+    assert (frame.index == frame.index.normalize()).all()
+
+
+def test_normalize_ohlcv_duplicate_keeps_last_and_drops_nan_close() -> None:
+    frame = normalize_ohlcv(_raw_history())
+
+    assert not frame.index.has_duplicates
+    assert frame.loc[pd.Timestamp("2026-01-06"), "close"] == pytest.approx(11.7)
+    assert pd.Timestamp("2026-01-07") not in frame.index
+    assert frame["close"].notna().all()
+
+
+def test_normalize_ohlcv_volume_is_float() -> None:
+    frame = normalize_ohlcv(_raw_history())
+
+    assert frame["volume"].dtype == "float64"
+    assert frame.loc[pd.Timestamp("2026-01-02"), "volume"] == pytest.approx(500.0)
+
+
+def test_normalize_ohlcv_handles_multiindex_columns() -> None:
+    raw = _raw_history()[["Open", "High", "Low", "Close", "Volume"]]
+    raw.columns = pd.MultiIndex.from_product(
+        [list(raw.columns), ["AAPL"]], names=["Price", "Ticker"]
+    )
+
+    frame = normalize_ohlcv(raw)
+
+    assert list(frame.columns) == ["open", "high", "low", "close", "volume"]
+    assert len(frame) == 3
+
+
+def test_normalize_ohlcv_empty_frame_is_canonical_and_empty() -> None:
+    frame = normalize_ohlcv(pd.DataFrame())
+
+    assert frame.empty
+    assert list(frame.columns) == ["open", "high", "low", "close", "volume"]
+    assert frame.index.name == "date"
+
+
+def test_normalize_ohlcv_missing_columns_raises() -> None:
+    raw = pd.DataFrame({"Open": [1.0], "Close": [1.1]}, index=[pd.Timestamp("2026-01-02")])
+
+    with pytest.raises(PriceFetchError):
+        normalize_ohlcv(raw)
+
+
+@pytest.mark.parametrize(
+    ("sector", "expected"),
+    [
+        ("Technology", "XLK"),
+        ("Financial Services", "XLF"),
+        ("Real Estate", "XLRE"),
+        (" Energy ", "XLE"),
+        ("Blockchain", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_sector_etf_for(sector: str | None, expected: str | None) -> None:
+    assert sector_etf_for(sector) == expected
+
+
+def test_static_maps() -> None:
+    assert MARKET_ETF == "SPY"
+    assert len(SECTOR_ETF) == 11
+    assert set(SECTOR_ETF.values()) == {
+        "XLK",
+        "XLF",
+        "XLE",
+        "XLV",
+        "XLY",
+        "XLP",
+        "XLI",
+        "XLB",
+        "XLU",
+        "XLRE",
+        "XLC",
+    }
+
+
+class _FakeFundsData:
+    def __init__(self, top_holdings: pd.DataFrame | None) -> None:
+        self.top_holdings = top_holdings
+
+
+class _FakeTicker:
+    """Stands in for yf.Ticker; each attribute is either data or an exception."""
+
+    def __init__(
+        self,
+        symbol: str,
+        *,
+        history: pd.DataFrame | None = None,
+        info: dict[str, Any] | None = None,
+        earnings: pd.DataFrame | None = None,
+        funds_data: _FakeFundsData | None = None,
+        boom: bool = False,
+    ) -> None:
+        self.symbol = symbol
+        self._history = history
+        self._info = info
+        self._earnings = earnings
+        self.funds_data = funds_data
+        self._boom = boom
+
+    def history(self, period: str = "1y", auto_adjust: bool = False) -> pd.DataFrame:
+        if self._boom:
+            raise RuntimeError("network down")
+        assert auto_adjust is False
+        return pd.DataFrame() if self._history is None else self._history
+
+    @property
+    def info(self) -> dict[str, Any]:
+        if self._boom:
+            raise RuntimeError("no info")
+        return self._info or {}
+
+    def get_earnings_dates(self, limit: int = 12) -> pd.DataFrame | None:
+        if self._boom:
+            raise RuntimeError("no earnings")
+        if self._earnings is None:
+            return None
+        return self._earnings.head(limit)
+
+
+def _install(monkeypatch: pytest.MonkeyPatch, tickers: dict[str, _FakeTicker]) -> None:
+    def factory(symbol: str) -> _FakeTicker:
+        if symbol not in tickers:
+            raise RuntimeError(f"unknown symbol {symbol}")
+        return tickers[symbol]
+
+    monkeypatch.setattr(prices.yf, "Ticker", factory)
+
+
+def test_fetch_ohlcv_normalizes(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(monkeypatch, {"AAPL": _FakeTicker("AAPL", history=_raw_history())})
+
+    frame = fetch_ohlcv("AAPL", period="6mo")
+
+    assert list(frame.columns) == ["open", "high", "low", "close", "volume"]
+    assert len(frame) == 3
+
+
+def test_fetch_ohlcv_raises_on_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(monkeypatch, {"ZZZZ": _FakeTicker("ZZZZ", history=pd.DataFrame())})
+
+    with pytest.raises(PriceFetchError, match="no price data for ZZZZ"):
+        fetch_ohlcv("ZZZZ")
+
+
+def test_fetch_ohlcv_raises_on_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(monkeypatch, {"BOOM": _FakeTicker("BOOM", boom=True)})
+
+    with pytest.raises(PriceFetchError, match="no price data for BOOM"):
+        fetch_ohlcv("BOOM")
+
+
+def test_fetch_info_maps_sector_etf(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(
+        monkeypatch,
+        {
+            "AAPL": _FakeTicker(
+                "AAPL",
+                info={
+                    "shortName": "Apple Inc.",
+                    "longName": "Apple Incorporated",
+                    "sector": "Technology",
+                    "industry": "Consumer Electronics",
+                },
+            )
+        },
+    )
+
+    info = fetch_info("AAPL")
+
+    assert info == TickerInfo(
+        ticker="AAPL",
+        name="Apple Inc.",
+        sector="Technology",
+        industry="Consumer Electronics",
+        sector_etf="XLK",
+    )
+
+
+def test_fetch_info_falls_back_to_long_name_then_ticker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install(
+        monkeypatch,
+        {
+            "A": _FakeTicker("A", info={"longName": "Agilent"}),
+            "B": _FakeTicker("B", info={}),
+        },
+    )
+
+    assert fetch_info("A") == TickerInfo("A", "Agilent", None, None, None)
+    assert fetch_info("B") == TickerInfo("B", "B", None, None, None)
+
+
+def test_fetch_info_degrades_on_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(monkeypatch, {"BOOM": _FakeTicker("BOOM", boom=True)})
+
+    assert fetch_info("BOOM") == TickerInfo("BOOM", "BOOM", None, None, None)
+
+
+def test_fetch_earnings_dates_sorted_unique_tz_naive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    index = pd.DatetimeIndex(
+        [
+            "2026-10-29 16:30:00",
+            "2026-07-30 16:30:00",
+            "2026-07-30 16:30:00",
+            "2027-01-28 16:30:00",
+        ],
+        name="Earnings Date",
+    ).tz_localize(TZ)
+    earnings = pd.DataFrame({"EPS Estimate": [1.0, 2.0, 2.0, 3.0]}, index=index)
+    _install(monkeypatch, {"AAPL": _FakeTicker("AAPL", earnings=earnings)})
+
+    assert fetch_earnings_dates("AAPL") == [
+        date(2026, 7, 30),
+        date(2026, 10, 29),
+        date(2027, 1, 28),
+    ]
+
+
+def test_fetch_earnings_dates_empty_on_none_or_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install(
+        monkeypatch,
+        {
+            "NONE": _FakeTicker("NONE", earnings=None),
+            "BOOM": _FakeTicker("BOOM", boom=True),
+        },
+    )
+
+    assert fetch_earnings_dates("NONE") == []
+    assert fetch_earnings_dates("BOOM") == []
+
+
+def test_fetch_peer_returns_skips_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(
+        monkeypatch,
+        {
+            "AMD": _FakeTicker("AMD", history=_raw_history()),
+            "DEAD": _FakeTicker("DEAD", history=pd.DataFrame()),
+        },
+    )
+
+    returns = fetch_peer_returns(["AMD", " AMD ", "DEAD"])
+
+    assert list(returns.columns) == ["AMD"]
+    assert returns.index.name == "date"
+    # first row of a pct_change is NaN, the rest are real returns
+    assert pd.isna(returns["AMD"].iloc[0])
+    assert returns["AMD"].iloc[1] == pytest.approx(10.2 / 9.1 - 1.0)
+
+
+def test_fetch_peer_returns_empty_when_all_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install(monkeypatch, {"DEAD": _FakeTicker("DEAD", history=pd.DataFrame())})
+
+    returns = fetch_peer_returns(["DEAD", ""])
+
+    assert returns.empty
+    assert list(returns.columns) == []
+
+
+def test_fetch_etf_holdings(monkeypatch: pytest.MonkeyPatch) -> None:
+    holdings = pd.DataFrame(
+        {
+            "Name": ["Nvidia", "Microsoft", "Apple"],
+            "Holding Percent": [0.15, 0.14, 0.13],
+        },
+        index=pd.Index(["NVDA", "msft", "AAPL"], name="Symbol"),
+    )
+    _install(
+        monkeypatch,
+        {
+            "XLK": _FakeTicker("XLK", funds_data=_FakeFundsData(holdings)),
+            "EMPTY": _FakeTicker("EMPTY", funds_data=_FakeFundsData(pd.DataFrame())),
+            "NOFUNDS": _FakeTicker("NOFUNDS", funds_data=None),
+        },
+    )
+
+    assert fetch_etf_holdings("XLK") == ["NVDA", "MSFT", "AAPL"]
+    assert fetch_etf_holdings("XLK", top_n=2) == ["NVDA", "MSFT"]
+    assert fetch_etf_holdings("EMPTY") == []
+    assert fetch_etf_holdings("NOFUNDS") == []
+    assert fetch_etf_holdings("UNKNOWN") == []
+
+
+@pytest.mark.skip(reason="network")
+def test_fetch_aapl_smoke() -> None:
+    """Hand-run smoke test against the live yfinance API (T15)."""
+    frame = fetch_ohlcv("AAPL", period="1mo")
+    assert not frame.empty
+    assert list(frame.columns) == ["open", "high", "low", "close", "volume"]
+    assert frame.index.tz is None
+
+    info = fetch_info("AAPL")
+    assert info.ticker == "AAPL"
+    assert info.sector_etf == "XLK"
+
+    assert fetch_earnings_dates("AAPL")
+    assert fetch_etf_holdings("XLK")
+    assert not fetch_peer_returns(["MSFT"], period="1mo").empty
