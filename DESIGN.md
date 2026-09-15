@@ -87,8 +87,16 @@ Articles are deduped on URL, stored once, and linked to moves through
   name/peer/macro-term hits; category = routing bucket; explanation = a
   templated sentence from the numbers. **The app runs with zero keys.**
 
+**The two providers are combined, not either/or.** The heuristic scorer runs
+first on every headline (free) and keeps the top-K per move (default 15).
+When a key is present the Anthropic provider sees only those K: it re-scores
+them and writes the explanation. So model usage is about one call per move,
+roughly ten per ticker, not one per headline. Final relevance with a key is
+the mean of the heuristic and model scores; without a key it is the heuristic
+alone. Model: `claude-sonnet-5`, fixed default in settings (never Opus).
+
 Explanation input: decomposition numbers, regime, earnings proximity, peer
-co-movement, top-K scored articles. Output is structured:
+co-movement, the top-K scored articles. Output is structured:
 
 ```json
 {"summary": "...", "primary_category": "company|industry|macro|unexplained",
@@ -99,9 +107,10 @@ Cached per move in `explanations`. Explanations are computed for the top-N
 moves by `abs(ret_z)` on ingest (default N=10) and on demand for any other move
 — this is the cost/time control.
 
-v2: the provider is replaced by our own fine-tuned relevance/category
-classifier trained on the accumulated `move_articles` labels; the LLM stays only
-for the prose.
+v2: a third provider, a Hugging Face classifier (relevance + category)
+fine-tuned on the accumulated `move_articles` labels, replaces the heuristic;
+the LLM stays only for the prose. It is out of v1 because torch/transformers
+would make "run one command" fragile for a reviewer.
 
 ## 5. Storage
 
@@ -111,8 +120,15 @@ moves and news is a **date window**, not semantics.
 Tables: `companies`, `prices`, `moves`, `articles`, `move_articles`,
 `explanations`, `chat_messages`.
 
-**Lazy population**: first `GET /tickers/{t}` ingests and caches; later GETs
-read; `?refresh=true` re-ingests. Ingest is idempotent on `(ticker, date)`.
+**Lazy population with a freshness rule**: on every read, if the newest
+stored price for the ticker is older than the last completed trading day
+(daily bars are final after the 4pm ET close), ingest the gap. Ingest is
+idempotent on `(ticker, date)`, so only new days are inserted, only new moves
+detected, and only new moves explained. So the update frequency is "on read,
+at most once per trading day per ticker"; `?refresh=true` forces it. A
+per-ticker `threading.Lock` stops two simultaneous first requests from both
+ingesting. No intraday data in v1. v2 moves the refresh to a scheduled job
+after the close so reads never pay for ingest.
 
 ## 6. API (FastAPI)
 
@@ -135,8 +151,12 @@ read; `?refresh=true` re-ingests. Ingest is idempotent on `(ticker, date)`.
 
 Paid news APIs with full text; semantic dedupe (pgvector); scheduled
 incremental ingest; multi-day move windows; executive/social commentary;
-confidence calibration against a labeled move set; deployment (v1 runs
-locally; Vercel would need the DB off disk).
+confidence calibration against a labeled move set; a Hugging Face
+classifier as the local provider; implied volatility from the options chain
+as an "expected move" baseline (yfinance has only the current chain, so it
+cannot explain past moves anyway); learned cross-ticker relationships
+(rolling correlation, lead-lag tests, hidden-state regime model); deployment
+(v1 runs locally; Vercel would need the DB off disk).
 
 ## 8. Naming
 
