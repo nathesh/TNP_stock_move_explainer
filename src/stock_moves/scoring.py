@@ -22,8 +22,10 @@ v1.5 adds a sixth stored number that is *not* one of the five and carries no
 weight: `geo_gate` (plan decision 7). A geopolitical headline is cheap to find
 and almost always irrelevant, so one is capped at `GEO_CAP` unless the company
 actually has the country edge *and* that country's factor is what moved the
-stock that day. The cap is applied after the weighted sum, so the five stored
-components still explain the number they produced.
+stock that day. The rule applies only to a company whose country edges are on
+record; with none on record there is nothing to contradict, so the gate stands
+down. The cap is applied after the weighted sum, so the five stored components
+still explain the number they produced.
 """
 
 from __future__ import annotations
@@ -217,9 +219,21 @@ def to_inputs(articles: Sequence[Article]) -> list[ArticleInput]:
 def geo_gate(title: str, move: MoveContext) -> float | None:
     """Whether a geopolitical headline may be credited to `move` (decision 7).
 
-    `None` means the gate does not apply: the title names none of the
-    geopolitical vocabulary, so it is scored like any other headline. When it
-    does apply the gate opens (1.0) only if *both* halves hold:
+    `None` means the gate does not apply, for either of two reasons:
+
+    * the title names none of the geopolitical vocabulary, or
+    * the company has no `country` edges on record at all
+      (`move.countries` is empty).
+
+    The second is the keyless case: country edges come only from the keyed
+    `suggest_relations` call, so a run without a key has no country edges for
+    *any* company. Absence of exposure data is not evidence of no exposure —
+    capping there would silently demote every tariff, sanctions and
+    export-control headline on the strength of a missing table, so the gate
+    stands down and the headline is scored like any other.
+
+    When the company *does* have country edges the gate applies, and opens
+    (1.0) only if *both* halves hold:
 
     * the title names a country the company has a `country` edge to, and
     * the day's `macro_driver` is that country's factor (`country:XX`) or one
@@ -229,11 +243,12 @@ def geo_gate(title: str, move: MoveContext) -> float | None:
     Either half alone is a coincidence — a tariff headline on a day no macro
     factor moved, or a macro day whose headline names a country the company
     does not touch — so the gate shuts (0.0) and `heuristic_relevance` caps the
-    score at `GEO_CAP`. Both or nothing is the point of the rule: without a
-    model key a company has no country edges at all, so the gate can never
-    open, which is the honest behaviour rather than a guess.
+    score at `GEO_CAP`. Both or nothing is the point of the rule, but it is a
+    rule about known exposure, not about unknown exposure.
     """
     if not geo.is_geo_headline(title):
+        return None
+    if not move.countries:
         return None
     named = geo.countries_in(title, [code for code, _ in move.countries])
     if not named:
@@ -358,9 +373,10 @@ def score_and_link(
     `context` is the v1.5 escape hatch for the gate rule. `MoveContext` knows
     nothing of `company_edges` or `geo_events` — they are separate tables and
     this module does not read them — so `from_objects` builds a context with no
-    countries, and :func:`geo_gate` then shuts on every geopolitical headline.
-    A caller that *has* read the edges (`ingest.enrich_move`) passes the fuller
-    context here and it is used verbatim. Nothing else about the scoring
+    countries, and :func:`geo_gate` then does not apply at all: with no edges
+    on record there is no exposure to check a headline against. A caller that
+    *has* read the edges (`ingest.enrich_move`) passes the fuller context here
+    and it is used verbatim. Nothing else about the scoring
     changes: the same context feeds the heuristic, the model and the gate.
     """
     if move.id is None:

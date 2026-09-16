@@ -91,14 +91,19 @@ the `supplier`/`customer` edges — the two numbers `sub_routing` is read off.
 vocabulary is capped at relevance `0.30` unless *both* hold — the title names a
 country the company has a `country` edge to, and the move's `macro_driver` is
 that country or `oil`/`dollar` — so a tariff story is never credited for a move
-the exposure and the prices do not both support.
+the exposure and the prices do not both support. The rule applies only when the
+company has `country` edges on record; with none, geopolitical headlines are
+scored like any other.
 
-**No key means no country edges, so the geo gate stays closed.** Country,
-supplier and customer edges come from one `suggest_relations` call per company;
-the keyless provider returns competitors from the sector ETF's holdings and
-nothing else. So without a working key there is no country to match, the gate
-never opens, and no `country:XX` sub-routing can fire. That is the honest
-behaviour rather than a bug, and it is why the smoke check below comes first.
+**No key means no country edges, so the gate never opens or shuts;
+geopolitical headlines score like any other and the country sub-routing is
+unreachable.** Country, supplier and customer edges come from one
+`suggest_relations` call per company; the keyless provider returns competitors
+from the sector ETF's holdings and nothing else. So without a working key there
+is no exposure on record to check a headline against — the gate stands down
+rather than capping on a missing table — and no `country:XX` sub-routing can
+fire. That is the honest behaviour rather than a bug, and it is why the smoke
+check below comes first.
 
 **Run the smoke check first, then the eval.** `scripts/smoke_model.py` is the
 first thing to run on any machine: it makes one call through the app's own

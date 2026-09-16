@@ -27,8 +27,9 @@ Exit codes: 0 every case passed, 1 at least one failed (a missing move on the
 date counts as a failure — the day is supposed to clear the move thresholds).
 
 Without a working key the run still completes, but `suggest_relations` returns
-competitors only, so there are no `country` edges, the geo gate never opens and
-a `country:XX` sub-routing is unreachable. The last line of the output says so.
+competitors only, so there are no `country` edges: the geo gate never opens or
+shuts, geopolitical headlines score like any other, and a `country:XX`
+sub-routing is unreachable. The last line of the output says so.
 """
 
 from __future__ import annotations
@@ -179,8 +180,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"provider used: {used}")
     if used == FALLBACK_PROVIDER_NAME:
         print(
-            "  heuristic: no country edges are suggested without a working key, "
-            "so the geo gate stays closed and no `country:XX` sub-routing can fire."
+            "  heuristic: no country edges are suggested without a working key, so the "
+            "geo gate never opens or shuts, geopolitical headlines score like any "
+            "other, and no `country:XX` sub-routing can fire."
         )
     return EXIT_FAILED if failures else EXIT_OK
 

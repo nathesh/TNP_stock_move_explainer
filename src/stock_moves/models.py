@@ -283,7 +283,8 @@ class MoveArticle(SQLModel, table=True):
     timing_kind: str | None = None  # "cause" | "report"
     model_score: float | None = None
     # v1.5 decision 7: 1.0 the geo gate opened, 0.0 it closed and `relevance`
-    # was capped, None the article never matched the geo vocabulary.
+    # was capped, None the gate did not apply: the article never matched the
+    # geo vocabulary, or the company has no country edges on record.
     geo_gate: float | None = None
 
 

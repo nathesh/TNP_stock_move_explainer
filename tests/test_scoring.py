@@ -505,6 +505,24 @@ def test_a_non_geo_headline_has_no_gate() -> None:
     assert heuristic_relevance(components) == pytest.approx(UNCAPPED)
 
 
+def test_no_country_edges_means_no_gate() -> None:
+    # The keyless case: country edges come only from the keyed relations call,
+    # so without a key no company has any. Absence of exposure data is not
+    # evidence of no exposure, so the gate stands down rather than capping
+    # every tariff headline on record.
+    ctx = _geo_ctx(countries=(), macro_driver=None)
+
+    assert geo_gate(GEO_TITLE, ctx) is None
+
+
+def test_no_country_edges_leaves_a_tariff_headline_uncapped() -> None:
+    components = _geo_components(_geo_ctx(countries=(), macro_driver=None))
+
+    assert components["geo_gate"] is None
+    assert heuristic_relevance(components) == pytest.approx(UNCAPPED)
+    assert heuristic_relevance(components) > GEO_CAP
+
+
 class EagerProvider(StubProvider):
     """A "model" that loves every headline — what the cap has to survive."""
 
@@ -545,15 +563,34 @@ def test_score_and_link_stores_a_shut_gate_and_caps_the_model(
 ) -> None:
     articles = _geo_article(session)
 
+    # China is on record as this company's exposure; the headline is about
+    # Taiwan, which is not — so the gate shuts, and the model's 1.0 cannot
+    # lift the mean back over the cap.
+    links = score_and_link(
+        session, move, _with_countries(company, (("CN", 1.0),)), articles, EagerProvider()
+    )
+
+    assert len(links) == 1
+    link = links[0]
+    assert link.geo_gate == pytest.approx(0.0)
+    assert link.model_score == pytest.approx(1.0)
+    assert link.relevance == pytest.approx(GEO_CAP)
+
+
+def test_score_and_link_does_not_gate_a_company_with_no_country_edges(
+    session: Session, company: Company, move: Move
+) -> None:
+    articles = _geo_article(session)
+
+    # The fixture company has no country edges — the keyless case — so the
+    # gate never applies and the tariff headline is scored like any other.
     links = score_and_link(session, move, company, articles, EagerProvider())
 
     assert len(links) == 1
     link = links[0]
-    # The fixture company has no country edges — the keyless case — so the
-    # gate shuts, and the model's 1.0 cannot lift the mean back over the cap.
-    assert link.geo_gate == pytest.approx(0.0)
+    assert link.geo_gate is None
     assert link.model_score == pytest.approx(1.0)
-    assert link.relevance == pytest.approx(GEO_CAP)
+    assert link.relevance > GEO_CAP
 
 
 def test_score_and_link_stores_an_open_gate(session: Session, company: Company, move: Move) -> None:
