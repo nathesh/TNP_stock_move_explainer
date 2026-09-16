@@ -66,32 +66,41 @@ leaving the first months null. And the keyless confidence now requires an event 
 cited headline, so "the company was mentioned" can no longer read as high confidence.
 
 There is also an eval now, three ticker-days fixed in the plan before the build:
-`scripts/eval_v15.py` ingests each ticker once and judges `routing` and `sub_routing`
-separately, exiting non-zero on any mismatch. It uses the network and is not part of pytest.
+`scripts/eval_v15.py` ingests each ticker once, explains the three days on demand when
+they fall outside the ingest's top-N, and judges `routing`, `sub_routing` and the citation
+(does a cited headline name the event) separately, exiting non-zero on any mismatch. It
+uses the network and is not part of pytest.
 
 Run on 2026-09-15 with no working key, so every explanation below is the heuristic's:
 
 - NVDA 2025-04-16 — routing: `industry`, sub_routing: none, expected `company` or `macro`
-  with `supply_chain` / `country:CN` / `country:TW`. FAIL, on both halves. The day was
+  with `supply_chain` / `country:CN` / `country:TW`. FAIL on both, citation PASS (the
+  cited headlines are the ASML warning, Barron's "chips are the latest trade war target"
+  and Bloomberg's $5.5B China-curbs line). The day was
   -6.9% at z -1.2, so it entered on the 2% gate as the plan said it would, but the whole
   semi complex fell with it and the OLS put it in the sector. The sub-bucket it was meant
   to land in needs a supplier edge to TSM or a country edge to CN or TW, and both of those
   are model-suggested, so keyless there was nothing for the rule to read.
 - NVDA 2025-01-27 — routing: `industry`, sub_routing: none, expected `industry` / none.
-  PASS, on both halves. -17.0% at z -5.8 with rivals down 6.0% alongside it, which is the
+  PASS on both, citation PASS. -17.0% at z -5.8 with rivals down 6.0% alongside it, which is the
   case the plan wanted: rivals moving *with* the stock yields `industry`, not `share_shift`.
   The cited headlines are the DeepSeek rout, led by CNBC's $600B market-cap line.
 - AAPL 2025-04-03 — routing: `macro`, sub_routing: `oil`, expected `country:CN` or
-  `dollar`. PASS on the routing, FAIL on the sub-bucket. `country:CN` was unreachable with
+  `dollar`. PASS on the routing, FAIL on the sub-bucket, citation PASS: the cited
+  headlines are the tariff stories (ABC, CNN, the Guardian). An earlier run of this eval
+  cited a Visa credit-card story first, because the geo gate shut on every tariff headline
+  for a company with no country edges on record; the gate now does not apply when there
+  are no country edges at all, and the tariff headlines lead. `country:CN` was unreachable with
   no country edge; `dollar` was reachable and lost, because oil's contribution was the
   largest among the proxies that cleared `abs(z) >= 1.5` that day. That is decision 4 doing
   exactly what it says, and pointing at the wrong story: the day was the tariff
   announcement, and the prose says "macro, via oil".
-- Overall: 1/3 passed, exit code 1, run on 2026-09-15 with the heuristic provider.
+- Overall: 1/3 cases passed on all three verdicts, exit code 1, run on 2026-09-15 with the
+  heuristic provider; by verdict, routing 2/3, sub_routing 1/3, citation 3/3.
 
 Two of the three misses are the keyless limitation stated below rather than broken code:
 `supply_chain` and `country:XX` cannot fire without a working key, so the ceiling on this
-eval keyless is 2/3, and the NVDA 2025-04-16 row cannot be scored at all. One miss is not:
+eval keyless is 2/3, and the NVDA 2025-04-16 sub-bucket cannot be scored at all. One miss is not:
 `oil` beating `dollar` on the AAPL tariff day is the univariate attribution picking the
 loudest proxy rather than the right one, and a key would not change it. The eval is
 therefore half-run until it is run with a key, and the row it would still get wrong is the
