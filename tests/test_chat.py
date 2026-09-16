@@ -202,3 +202,124 @@ def test_no_ticker_anywhere_is_a_message_not_a_crash(client: TestClient) -> None
     body = response.json()
     assert body["tool_calls"] == []
     assert "ticker" in body["reply"].lower()
+
+
+# --------------------------------------------------------------------------- #
+# Ranking: "biggest" is a question about size, not about how unusual a day was
+# --------------------------------------------------------------------------- #
+
+#: The pair that made the bug visible: the most unusual day for the stock is
+#: not its largest fall, and a z-ordered answer led with the wrong one.
+UNUSUAL_DAY = date(2026, 1, 20)  # -3.5%, z -5.2
+LARGEST_DAY = date(2026, 7, 31)  # -7.4%, z -4.0
+
+
+def _seed_two_falls(session: Session) -> None:
+    """One company and two down days whose two rankings disagree."""
+    session.add(
+        Company(
+            ticker=TICKER,
+            name="Testco Industries",
+            sector="Technology",
+            industry="Semiconductors",
+            sector_etf="XLK",
+        )
+    )
+    for day, ret, ret_z in ((UNUSUAL_DAY, -0.035, -5.2), (LARGEST_DAY, -0.074, -4.0)):
+        session.add(
+            Move(
+                ticker=TICKER,
+                date=day,
+                ret=ret,
+                ret_z=ret_z,
+                mkt_component=-0.005,
+                sector_component=-0.005,
+                idio_component=ret + 0.01,
+                routing="company",
+                direction="down",
+            )
+        )
+    session.commit()
+
+
+@pytest.fixture
+def ranking_client(no_api_key: None) -> Iterator[TestClient]:
+    """The `client` fixture's wiring, seeded with the disagreeing pair."""
+    engine = configure_engine("sqlite://")
+    init_db(engine)
+    with Session(engine) as seed_session:
+        _seed_two_falls(seed_session)
+
+    deps.reset_provider_cache()
+    with TestClient(create_app()) as test_client:
+        yield test_client
+    deps.reset_provider_cache()
+    engine.dispose()
+
+
+def test_an_order_in_the_request_reaches_list_moves(ranking_client: TestClient) -> None:
+    """The argument is echoed in `tool_calls` and it is what ranked the rows."""
+    response = ranking_client.post(
+        "/chat", json={"message": "biggest TEST falls", "ticker": TICKER}
+    )
+    assert response.status_code == 200
+
+    call = response.json()["tool_calls"][0]
+    assert call["name"] == "list_moves"
+    assert call["input"]["order"] == "pct"
+    assert [move["date"] for move in call["output"]] == [
+        LARGEST_DAY.isoformat(),
+        UNUSUAL_DAY.isoformat(),
+    ]
+
+
+def test_a_superlative_question_answers_with_one_move_ranked_by_size(
+    ranking_client: TestClient,
+) -> None:
+    """The bug: "drop the most" used to return a five-row z-ordered dump led by
+    the 3.5% day."""
+    response = ranking_client.post(
+        "/chat", json={"message": "Why did TEST drop the most this year?", "ticker": TICKER}
+    )
+    assert response.status_code == 200
+
+    body = response.json()
+    call = body["tool_calls"][0]
+    assert call["name"] == "list_moves"
+    assert call["input"]["order"] == "pct"
+    assert call["input"]["limit"] == 1
+    assert [move["date"] for move in call["output"]] == [LARGEST_DAY.isoformat()]
+
+    reply = body["reply"]
+    assert "the biggest fall in the data" in reply
+    assert "Friday, 31 July 2026 -- down 7.4%" in reply
+    assert "20 January 2026" not in reply
+
+
+def test_a_plural_question_keeps_the_five_row_list(ranking_client: TestClient) -> None:
+    response = ranking_client.post(
+        "/chat", json={"message": "what were TEST's biggest moves?", "ticker": TICKER}
+    )
+    assert response.status_code == 200
+
+    call = response.json()["tool_calls"][0]
+    assert call["input"]["limit"] == 5
+    assert call["input"]["order"] == "pct"
+    assert len(call["output"]) == 2
+
+
+def test_a_plain_question_is_still_ranked_by_how_unusual_the_day_was(
+    ranking_client: TestClient,
+) -> None:
+    response = ranking_client.post("/chat", json={"message": "why did TEST fall", "ticker": TICKER})
+    assert response.status_code == 200
+
+    body = response.json()
+    call = body["tool_calls"][0]
+    assert call["input"]["order"] == "z"
+    assert [move["date"] for move in call["output"]] == [
+        UNUSUAL_DAY.isoformat(),
+        LARGEST_DAY.isoformat(),
+    ]
+    # And the header says which ranking it is, rather than claiming "biggest".
+    assert "the two most unusual falls in the data" in body["reply"]

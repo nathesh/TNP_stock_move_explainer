@@ -19,6 +19,11 @@ Explanations follow whatever provider the environment gives: with a valid
 `ANTHROPIC_API_KEY` they are model-written and cited, without one they are
 templated from the decomposition. The snapshot records which, per row, so a
 rebuild with a key is visible in the data rather than a matter of trust.
+
+Because a ticker with prices is skipped, this script will not re-explain what
+is already there. When only the *phrasing* has changed, run
+`scripts/renarrate_snapshot.py` instead: it rewrites the keyless explanations
+in place from the stored scores and re-gzips, without refetching anything.
 """
 
 from __future__ import annotations

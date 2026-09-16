@@ -89,7 +89,9 @@ and each is a consequence of how serverless hosting differs from a laptop:
   year each. `/tmp` is per-instance and wiped on a cold start, so without a
   seed the first visitor would meet an empty page; `stock_moves.seed` expands
   the snapshot when no database is present. Rebuild it with
-  `uv run python scripts/build_snapshot.py`.
+  `uv run python scripts/build_snapshot.py`. After a change to the phrasing,
+  `uv run python scripts/renarrate_snapshot.py` rewrites the snapshot's keyless
+  explanations in place and re-gzips it, off the network and without a key.
 
 ```bash
 vercel deploy          # preview
@@ -140,12 +142,12 @@ curl -s 'http://127.0.0.1:8000/tickers/AAPL?direction=down&limit=5' | python -m 
     {
       "date": "2026-07-31",
       "ret": -0.073539, "ret_z": -4.03945,
-      "gap_ret": -0.010958, "intraday_ret": -0.023859, "vol_z": 1.799384,
+      "gap_ret": -0.085835, "intraday_ret": 0.013451, "vol_z": 2.60752,
       "routing": "company", "near_earnings": true,
       "mkt_component": 0.010, "sector_component": 0.001, "idio_component": -0.084,
       "peer_comove": -0.000527,
       "explanation": {
-        "summary": "Apple was down 7.4% on Friday, 31 July 2026. That is roughly four times the size of a typical day for AAPL. Most of it was Apple itself, worth 8.4 points on its own -- more than the 7.4-point move, with 1.0 from the wider market and 0.1 from the rest of the sector both pushing the other way. The move landed within a day of the company's own earnings.",
+        "summary": "Apple was down 7.4% on Friday, 31 July 2026. That is roughly four times the size of a typical day for AAPL. Most of it was Apple itself, worth 8.4 points on its own -- more than the 7.4-point move, with 1.0 from the wider market and 0.1 from the rest of the sector both pushing the other way. The move landed within a day of the company's own earnings. Comparable companies were down 0.1% on average that day -- far less, so AAPL moved largely on its own. Reported that day: the day's coverage led with “Apple stock falls on weak revenue forecast as CEO Tim Cook flags 'increasing impact' from memory shortage” (Yahoo Finance).",
         "primary_category": "company", "confidence": 0.9,
         "cited_article_ids": [31, 33, 36], "unexplained": false
       },

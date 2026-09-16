@@ -332,7 +332,8 @@ def test_chat_surfaces_the_get_move_error_instead_of_a_blank_explanation() -> No
     get_move, _ = recording_tool({"error": "no move for TEST on 2025-06-04"})
     tools: dict[str, ToolFn] = {"get_move": get_move}
     reply = PROVIDER.chat([ChatTurn("user", "what happened to TEST on 2025-06-04")], tools, None)
-    assert reply.reply == "no move for TEST on 2025-06-04"
+    # Said as a sentence rather than replayed as the raw developer string.
+    assert reply.reply == "TEST did not have a major move on Wednesday, 4 June 2025."
     assert "No explanation yet" not in reply.reply
 
 
@@ -347,11 +348,16 @@ def test_chat_asking_for_news_calls_search_news() -> None:
 def test_chat_asking_why_it_dropped_lists_down_moves() -> None:
     tools, calls = _chat_tools()
     reply = PROVIDER.chat([ChatTurn("user", "why did TEST drop")], tools, None)
-    assert calls["list_moves"] == [{"ticker": "TEST", "direction": "down", "limit": 5}]
+    # No superlative in the question, so the survey ranking and row count
+    # stand: five moves, ranked by how unusual each day was.
+    assert calls["list_moves"] == [
+        {"ticker": "TEST", "direction": "down", "order": "z", "limit": 5}
+    ]
     assert calls["get_move"] == [] and calls["search_news"] == []
     # The synthesis: what the set is, then each move as a dated block. No
-    # z-score reaches the reader.
-    assert "the biggest fall in the data" in reply.reply
+    # z-score reaches the reader. The header names the ranking it got, so a
+    # z-ordered list is not called "the biggest fall".
+    assert "the most unusual fall in the data" in reply.reply
     assert "Tuesday, 3 June 2025 -- down 5.0%" in reply.reply
     assert_no_jargon(reply.reply)
 
@@ -473,3 +479,99 @@ def test_get_provider_falls_back_to_the_heuristic_without_a_key() -> None:
     provider = get_provider(SimpleNamespace(anthropic_api_key=None))
     assert isinstance(provider, HeuristicProvider)
     assert provider.name == "heuristic"
+
+
+# --------------------------------------------------------------------------- #
+# Superlative questions, and two polish items in the same router
+# --------------------------------------------------------------------------- #
+
+
+def test_a_superlative_question_asks_for_one_move_ranked_by_size() -> None:
+    """ "Drop the most" is a question about size and about one day. Ranking it
+    by z and answering with five rows is the bug this fixes."""
+    tools, calls = _chat_tools()
+    PROVIDER.chat([ChatTurn("user", "why did TEST drop the most this year?")], tools, None)
+    assert calls["list_moves"] == [
+        {"ticker": "TEST", "direction": "down", "order": "pct", "limit": 1}
+    ]
+
+
+def test_single_biggest_one_day_drop_is_one_move() -> None:
+    """ "one-day" hides the word "one"; it is not a row count."""
+    tools, calls = _chat_tools()
+    PROVIDER.chat(
+        [ChatTurn("user", "what was TEST's single biggest one-day drop, and by how much?")],
+        tools,
+        None,
+    )
+    assert calls["list_moves"][0]["limit"] == 1
+    assert calls["list_moves"][0]["order"] == "pct"
+
+
+def test_a_plural_superlative_keeps_the_list() -> None:
+    tools, calls = _chat_tools()
+    PROVIDER.chat([ChatTurn("user", "what were TEST's biggest falls?")], tools, None)
+    assert calls["list_moves"][0]["limit"] == 5
+    assert calls["list_moves"][0]["order"] == "pct"
+
+
+def test_a_named_count_keeps_the_list() -> None:
+    tools, calls = _chat_tools()
+    PROVIDER.chat([ChatTurn("user", "TEST's worst 3 sessions")], tools, None)
+    assert calls["list_moves"][0]["limit"] == 5
+
+    tools, calls = _chat_tools()
+    PROVIDER.chat([ChatTurn("user", "the three worst TEST sessions")], tools, None)
+    assert calls["list_moves"][0]["limit"] == 5
+
+
+def test_a_plain_question_keeps_the_survey_ranking() -> None:
+    tools, calls = _chat_tools()
+    PROVIDER.chat([ChatTurn("user", "what moved TEST around?")], tools, None)
+    assert calls["list_moves"][0]["order"] == "z"
+    assert calls["list_moves"][0]["limit"] == 5
+
+
+def test_a_superlative_header_says_biggest() -> None:
+    tools, _ = _chat_tools()
+    reply = PROVIDER.chat([ChatTurn("user", "TEST's biggest drop ever")], tools, None)
+    assert "the biggest fall in the data" in reply.reply
+    assert_no_jargon(reply.reply)
+
+
+def test_the_no_ticker_example_date_is_inside_the_data_window() -> None:
+    """2025-08-28 was outside it, so the first thing a new user copied was a
+    question with no answer. It matches the chat box's placeholder."""
+    tools, calls = _chat_tools()
+    reply = PROVIDER.chat([ChatTurn("user", "so what happened?")], tools, None)
+    assert "2026-01-20" in reply.reply
+    assert "2025-08-28" not in reply.reply
+    assert all(c == [] for c in calls.values())
+
+
+def test_an_unrecognised_get_move_error_is_passed_through() -> None:
+    """Only the documented shape is rewritten; anything else reaches the user
+    as it stands rather than being swallowed."""
+    get_move, _ = recording_tool({"error": "database is on fire"})
+    reply = PROVIDER.chat(
+        [ChatTurn("user", "what happened to TEST on 2026-03-02")], {"get_move": get_move}, None
+    )
+    assert reply.reply == "database is on fire"
+
+
+def test_the_get_move_error_names_the_day_in_english() -> None:
+    get_move, _ = recording_tool({"error": "no move for AAPL on 2026-03-02"})
+    reply = PROVIDER.chat(
+        [ChatTurn("user", "what happened to AAPL on 2026-03-02")], {"get_move": get_move}, None
+    )
+    assert reply.reply == "AAPL did not have a major move on Monday, 2 March 2026."
+
+
+def test_the_list_moves_spec_documents_the_order_argument() -> None:
+    spec = next(s for s in TOOL_SPECS if s["name"] == "list_moves")
+    order = spec["input_schema"]["properties"]["order"]
+    assert order["enum"] == ["z", "pct"]
+    assert order["default"] == "z"
+    assert "biggest" in order["description"]
+    # The description no longer promises one ordering unconditionally.
+    assert "sorted by absolute z-score" not in spec["description"]

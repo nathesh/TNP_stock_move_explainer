@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
+from datetime import date
 from typing import Any
 
 from stock_moves import narrate
@@ -67,6 +68,67 @@ _TICKER_STOPLIST: frozenset[str] = frozenset(
 
 _DOWN_WORDS: tuple[str, ...] = ("drop", "fall", "down", "plunge", "sank")
 _UP_WORDS: tuple[str, ...] = ("jump", "rise", "up", "rally", "soar")
+
+#: Words that ask for an extreme rather than a survey. They decide the
+#: *ranking*: a reader who says "biggest" means the largest percentage move,
+#: not the most statistically unusual one, and the two are routinely different
+#: days.
+_SUPERLATIVE_WORDS: tuple[str, ...] = (
+    "most",
+    "biggest",
+    "largest",
+    "greatest",
+    "worst",
+    "best",
+    "sharpest",
+    "steepest",
+    "deepest",
+    "single",
+    "record",
+)
+
+#: Plural nouns for a move. "The biggest falls" wants a list; "the biggest
+#: fall" wants one day, and answering it with five is the dump this fixes.
+_PLURAL_MOVE_WORDS: tuple[str, ...] = (
+    "moves",
+    "days",
+    "falls",
+    "drops",
+    "gains",
+    "rallies",
+    "declines",
+    "times",
+    "losses",
+    "swings",
+)
+
+#: Spelled-out counts that mean "more than one". "one" is deliberately absent:
+#: it asks for a single move anyway, and it hides inside "one-day".
+_COUNT_WORDS: tuple[str, ...] = (
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+    "couple",
+    "few",
+    "several",
+)
+
+#: A digit count ("top 3"). One or two digits only, so a bare year does not
+#: read as a row count.
+_COUNT_DIGITS_RE = re.compile(r"(?<!\d)\d{1,2}(?!\d)")
+
+#: `{"error": "no move for TICKER on YYYY-MM-DD"}` from `tool_get_move`.
+_NO_MOVE_RE = re.compile(r"^no move for (\S+) on (\d{4}-\d{2}-\d{2})$")
+
+#: Rows returned for a superlative question, and for a survey question.
+_SINGLE_LIMIT = 1
+_LIST_LIMIT = 5
 
 _COMPONENT_LABELS: tuple[str, str, str] = ("market", "sector", "idiosyncratic")
 
@@ -187,6 +249,49 @@ def _guess_direction(lowered: str) -> str | None:
     if any(w in lowered for w in _UP_WORDS):
         return "up"
     return None
+
+
+def _wants_superlative(lowered: str) -> bool:
+    """True when the question asks for an extreme ("the biggest fall").
+
+    Whole-word matching, so "mostly" is not "most" and "singled" is not
+    "single".
+    """
+    norm = _normalise(lowered)
+    return any(_has_word(norm, word) for word in _SUPERLATIVE_WORDS)
+
+
+def _names_several(lowered: str) -> bool:
+    """True when the question asks for more than one move.
+
+    Either a plural noun ("the biggest falls") or a count ("top 3", "the three
+    worst days"). Without one of those, a superlative question is about a
+    single day and should be answered with a single day.
+    """
+    norm = _normalise(lowered)
+    if any(_has_word(norm, word) for word in _PLURAL_MOVE_WORDS):
+        return True
+    if any(_has_word(norm, word) for word in _COUNT_WORDS):
+        return True
+    return _COUNT_DIGITS_RE.search(norm) is not None
+
+
+def _no_move_sentence(error: str) -> str:
+    """`no move for TEST on 2026-03-02` said as a sentence.
+
+    The raw error is a developer string: lower-cased, undated in English and
+    starting mid-thought. A reader who asked about a quiet day should be told
+    the day was quiet, in the same voice as every other answer.
+    """
+    match = _NO_MOVE_RE.match(error.strip())
+    if match is None:
+        return error
+    ticker, day = match.groups()
+    try:
+        parsed = date.fromisoformat(day)
+    except ValueError:
+        return error
+    return f"{ticker} did not have a major move on {narrate.plain_day(parsed)}."
 
 
 def _as_list(output: Any, key: str) -> list[dict[str, Any]]:
@@ -345,7 +450,10 @@ class HeuristicProvider:
         lowered = text.lower()
         resolved = ticker or _guess_ticker(text)
         if not resolved:
-            return ChatReply("Tell me a ticker, e.g. 'why did NVDA drop on 2025-08-28?'", [])
+            # The example date has to be inside the data window, or the first
+            # thing a new user copies is a question with no answer. It matches
+            # the chat box's own placeholder.
+            return ChatReply("Tell me a ticker, e.g. 'why did NVDA drop on 2026-01-20?'", [])
 
         date_match = _DATE_RE.search(text)
         day = date_match.group(0) if date_match else None
@@ -360,10 +468,17 @@ class HeuristicProvider:
             payload = {"ticker": resolved, "date": day}
         else:
             name = "list_moves"
+            # "Biggest" is a question about size, so it has to change the
+            # ranking as well as the row count: the z-ordered list's lead row
+            # is routinely not the largest move in it.
+            superlative = _wants_superlative(lowered)
             payload = {
                 "ticker": resolved,
                 "direction": _guess_direction(lowered),
-                "limit": 5,
+                "order": "pct" if superlative else "z",
+                "limit": (
+                    _SINGLE_LIMIT if superlative and not _names_several(lowered) else _LIST_LIMIT
+                ),
             }
 
         tool = tools.get(name)
@@ -395,7 +510,7 @@ class HeuristicProvider:
                 return f"No move stored for {ticker} on {payload.get('date')}."
             error = output.get("error")
             if error:
-                return str(error)
+                return _no_move_sentence(str(error))
             return narrate.narrate_one_move(
                 ticker, output, company, model_summary=_stored_summary(output)
             )
@@ -404,7 +519,13 @@ class HeuristicProvider:
             moves = _as_list(output, "moves")
             if not moves:
                 return f"No stored moves for {ticker}."
-            return narrate.narrate_moves(ticker, moves, company, direction=payload.get("direction"))
+            return narrate.narrate_moves(
+                ticker,
+                moves,
+                company,
+                direction=payload.get("direction"),
+                order=str(payload.get("order") or "z"),
+            )
 
         return narrate.narrate_news(ticker, _as_list(output, "articles"))
 

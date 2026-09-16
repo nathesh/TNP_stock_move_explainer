@@ -260,8 +260,8 @@ TOOL_SPECS: list[dict[str, Any]] = [
     {
         "name": "list_moves",
         "description": (
-            "Largest daily moves for a ticker, sorted by absolute z-score, with "
-            "the cached explanation summary when one exists. " + _MOVE_SHAPE
+            "The ticker's notable daily moves, ranked by `order`, with the "
+            "cached explanation summary when one exists. " + _MOVE_SHAPE
         ),
         "input_schema": {
             "type": "object",
@@ -282,6 +282,18 @@ TOOL_SPECS: list[dict[str, Any]] = [
                     "type": "string",
                     "enum": ["up", "down"],
                     "description": "Keep only up days or only down days.",
+                },
+                "order": {
+                    "type": "string",
+                    "enum": ["z", "pct"],
+                    "description": (
+                        "How to rank the moves. 'z' (default) ranks by how "
+                        "unusual the day was for that stock, which is not the "
+                        "same as how large it was. 'pct' ranks by the size of "
+                        "the percentage move -- use it for 'biggest', "
+                        "'largest', 'most', 'worst' or 'best' questions."
+                    ),
+                    "default": "z",
                 },
                 "limit": {
                     "type": "integer",

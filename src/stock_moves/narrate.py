@@ -281,6 +281,37 @@ def size_phrase(ret_z: float, ticker: str) -> str:
     return f"That is {lead}{multiple} the size of a typical day for {ticker}."
 
 
+def _components(facts: MoveFacts) -> list[tuple[str, str, float]]:
+    """The components that exist, as `(kind, label, value)`, largest first.
+
+    `kind` is the machine-readable half -- prose reads "the rest of the sector",
+    code asks whether the company's own part won.
+    """
+    labelled = (
+        ("market", "the wider market", facts.mkt_component),
+        ("sector", "the rest of the sector", facts.sector_component),
+        ("company", f"{facts.company} itself", facts.idio_component),
+    )
+    present = [(kind, label, value) for kind, label, value in labelled if value is not None]
+    present.sort(key=lambda item: abs(item[2]), reverse=True)
+    return present
+
+
+def _dominant(facts: MoveFacts) -> tuple[str, str, float] | None:
+    """The largest component by size, sign ignored, or `None` if there is no
+    usable decomposition.
+
+    One function, two callers, on purpose: the attribution sentence and the
+    peers sentence sit two lines apart in the output, and they used to reach
+    opposite conclusions about which part of the move was the big one because
+    each worked it out its own way.
+    """
+    present = _components(facts)
+    if not present or sum(abs(value) for _, _, value in present) <= 0:
+        return None
+    return present[0]
+
+
 def attribution_sentence(facts: MoveFacts) -> str | None:
     """Split the move into market, sector and company in points of the move.
 
@@ -290,24 +321,17 @@ def attribution_sentence(facts: MoveFacts) -> str | None:
     called out as pushing the other way, because silently reporting its size
     would read as if it had contributed.
     """
-    labelled = [
-        ("the wider market", facts.mkt_component),
-        ("the rest of the sector", facts.sector_component),
-        (f"{facts.company} itself", facts.idio_component),
-    ]
-    present = [(label, value) for label, value in labelled if value is not None]
     # Said rather than skipped: a reader who is told how large the move was and
     # then hears nothing about what drove it should know the split is missing,
     # not be left to assume it was unremarkable.
     absent = "There is no market-versus-company breakdown for this day."
-    if not present:
+    top = _dominant(facts)
+    if top is None:
         return absent
 
-    total = sum(abs(value) for _, value in present)
-    if total <= 0:
-        return absent
-    present.sort(key=lambda item: abs(item[1]), reverse=True)
-    top_label, top_value = present[0]
+    present = _components(facts)
+    total = sum(abs(value) for _, _, value in present)
+    _, top_label, top_value = top
     points = abs(facts.ret) * 100
 
     # The verdict already names the dominant component, so the breakdown that
@@ -315,15 +339,37 @@ def attribution_sentence(facts: MoveFacts) -> str | None:
     # from Tesla itself" is what naming it twice reads like).
     # The two directions are grouped so "pushing the other way" is said once
     # for however many components did it, not once each.
-    with_move: list[str] = []
-    against_move: list[str] = []
-    for label, value in present[1:]:
+    with_move: list[tuple[str, float]] = []
+    against_move: list[tuple[str, float]] = []
+    for _kind, label, value in present[1:]:
+        component_points = abs(value) * 100
+        # "and 0.0 from the rest of the sector" is noise: a part that rounds to
+        # nothing is only a component of the move in the arithmetic sense. The
+        # dominant one is kept however small, because dropping it would leave
+        # the sentence with nothing to be about.
+        if component_points < 0.05:
+            continue
         bucket = against_move if (value < 0) != (facts.ret < 0) else with_move
-        bucket.append(f"{abs(value) * 100:.1f} from {label}")
-    breakdown = list(with_move)
-    if against_move:
-        tail = "both pushing the other way" if len(against_move) > 1 else "pushing the other way"
-        breakdown.append(f"{_join(against_move)} {tail}")
+        bucket.append((label, component_points))
+
+    if with_move and against_move:
+        # "with 1.9 from NVIDIA itself and 2.8 from the wider market pushing
+        # the other way" lets the trailing participle attach to both, so the
+        # reader takes the 1.9 to have pushed the move along when it did the
+        # opposite. When the remainder splits, each side says its own
+        # direction, in its own clause.
+        same = _join([f"{value:.1f} from {label}" for label, value in with_move])
+        other = _join([f"{label} pushed {value:.1f}" for label, value in against_move])
+        breakdown = f"{same} in the same direction, while {other} the other way"
+    else:
+        parts = [f"{value:.1f} from {label}" for label, value in with_move]
+        if against_move:
+            against_parts = [f"{value:.1f} from {label}" for label, value in against_move]
+            tail = (
+                "both pushing the other way" if len(against_parts) > 1 else "pushing the other way"
+            )
+            parts.append(f"{_join(against_parts)} {tail}")
+        breakdown = _join(parts)
 
     share = abs(top_value) / total
     verdict = (
@@ -344,7 +390,7 @@ def attribution_sentence(facts: MoveFacts) -> str | None:
     else:
         sentence = f"{verdict}: {top_points:.1f} of the {points:.1f} points"
     if breakdown:
-        sentence += f", with {_join(breakdown)}"
+        sentence += f", with {breakdown}"
     return f"{sentence}."
 
 
@@ -366,7 +412,16 @@ def event_sentence(facts: MoveFacts) -> str | None:
 
 def peers_sentence(facts: MoveFacts) -> str | None:
     """Whether comparable companies moved with it, which is the cheapest test
-    of "was this the company or the sector?" available without a model."""
+    of "was this the company or the sector?" available without a model.
+
+    It is a *second* reading of the same question the decomposition answers,
+    and the two can come out differently -- peers are a handful of named
+    companies, the sector component is a fitted factor. When they do, this
+    sentence says so. It used to answer on its own and contradict the
+    attribution sentence two lines above it ("Most of it was the rest of the
+    sector ... NVDA moved largely on its own"), which reads as the app not
+    believing itself.
+    """
     peer = facts.peer_comove
     if peer is None:
         return None
@@ -382,12 +437,38 @@ def peers_sentence(facts: MoveFacts) -> str | None:
     together = (peer < 0) == (facts.ret < 0)
     ratio = abs(peer) / move
     if together and ratio >= _PEERS_TOGETHER:
-        return f"{peer_text}, so the whole group moved together."
-    if not together:
-        return f"{peer_text} -- the opposite direction, so this was {facts.ticker}'s own move."
-    if ratio <= _PEERS_ALONE:
+        peers_say = "together"
+    elif not together or ratio <= _PEERS_ALONE:
+        peers_say = "alone"
+    else:
+        peers_say = "mixed"
+
+    # A middling peer average claims nothing strong enough to disagree with.
+    if peers_say == "mixed":
+        return f"{peer_text}, so some of this was shared across the group."
+
+    top = _dominant(facts)
+    company_led = top is not None and top[0] == "company"
+    if top is None or company_led == (peers_say == "alone"):
+        if peers_say == "together":
+            return f"{peer_text}, so the whole group moved together."
+        if not together:
+            return f"{peer_text} -- the opposite direction, so this was {facts.ticker}'s own move."
         return f"{peer_text} -- far less, so {facts.ticker} moved largely on its own."
-    return f"{peer_text}, so some of this was shared across the group."
+
+    # The two readings disagree. Neither verdict may be asserted as if the
+    # other did not exist, and the tension is the honest thing to report.
+    if peers_say == "together":
+        return (
+            f"{peer_text}, so the group moved with it even though the split above "
+            f"puts the bigger part of the move on {facts.company} itself."
+        )
+    led = "sector" if top is not None and top[0] == "sector" else "market"
+    gap = "the opposite direction" if not together else f"far less than {facts.ticker}"
+    return (
+        f"{peer_text} -- {gap}, which sits oddly with the {led}-led split above; "
+        "read that split with some caution."
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -513,22 +594,40 @@ def _set_summary(facts: Sequence[MoveFacts]) -> str | None:
     return f"Taken together, {joined}."
 
 
+def _set_noun(direction: str | None, order: str) -> str:
+    """What to call the set, in the singular, given how it was ranked.
+
+    The header is the one line a reader takes the ranking from, so it has to
+    name the ranking that actually produced the rows. A z-ordered list led by
+    a 3.5% fall is not "the biggest fall" -- it is the most unusual one, and
+    calling it the biggest is how the wrong day ends up quoted back.
+    """
+    kind = {"down": "fall", "up": "gain"}.get(direction or "", "move")
+    adjective = "biggest" if order == "pct" else "most unusual"
+    return f"{adjective} {kind}"
+
+
 def narrate_moves(
     ticker: str,
     moves: Sequence[Mapping[str, Any]],
     company: str = "",
     direction: str | None = None,
+    order: str = "z",
 ) -> str:
     """The synthesis handed to a reader in place of one row per move.
 
     Structure: what this set is, what it has in common, then each move as its
     own dated block, then the caveat once.
+
+    `order` is the ranking the rows arrived in ("z" or "pct"), and it decides
+    only what the header calls them -- the rows are already in whatever order
+    the query layer put them in.
     """
     if not moves:
         return f"No stored moves for {ticker}."
 
     facts = [MoveFacts.from_mapping(move, ticker, company) for move in moves]
-    singular = {"down": "biggest fall", "up": "biggest gain"}.get(direction or "", "biggest move")
+    singular = _set_noun(direction, order)
     subject = short_company_name(company or ticker, ticker)
     if len(moves) == 1:
         header = f"{subject} ({ticker}) -- the {singular} in the data"

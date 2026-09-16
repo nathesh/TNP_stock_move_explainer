@@ -60,6 +60,11 @@ _PLACES = 6
 _DAY_START = time(0, 0, 0)
 _DAY_END = time(23, 59, 59, 999999)
 
+#: The orderings `MoveFilters.order` accepts. Anything else is a caller bug
+#: (or a model that invented a value), so it raises rather than silently
+#: falling back to a ranking the reader did not ask for.
+_ORDERS: frozenset[str] = frozenset({"z", "pct"})
+
 
 @dataclass
 class MoveFilters:
@@ -73,6 +78,12 @@ class MoveFilters:
     `min_relevance` is not used by `list_moves`; it travels with the rest of
     the filters because the same bundle drives the article queries on the
     ticker route.
+
+    `order` picks what "biggest" means. `"z"` ranks by how unusual the day was
+    for this stock (the default, and what the move detector itself cares
+    about); `"pct"` ranks by the raw size of the percentage move, which is what
+    a reader asking for the biggest fall means. The two disagree often enough
+    to matter: a -3.5% day in a quiet stretch outranks a -7.4% day on z.
     """
 
     start: date | None = None
@@ -83,6 +94,7 @@ class MoveFilters:
     category: str | None = None
     min_relevance: float = 0.0
     limit: int = 50
+    order: str = "z"
 
 
 # --------------------------------------------------------------------------- #
@@ -161,13 +173,19 @@ def list_prices(
 
 
 def list_moves(session: Session, ticker: str, filters: MoveFilters) -> list[Move]:
-    """Moves for a ticker matching `filters`, biggest absolute z-score first.
+    """Moves for a ticker matching `filters`, ranked by `filters.order`.
+
+    `"z"` (the default) puts the most unusual day for this stock first; `"pct"`
+    puts the largest percentage move first, which is the ranking behind a
+    "biggest fall" question. Ties break on date, newest first, in both.
 
     `category` matches the explanation's `primary_category` when the move has
     been explained and falls back to the quantitative `routing` when it has
     not, so filtering by category does not silently drop every unexplained
     move. The outer join cannot fan rows out: `explanations.move_id` is unique.
     """
+    if filters.order not in _ORDERS:
+        raise ValueError(f"order must be one of {sorted(_ORDERS)}, got {filters.order!r}")
     statement = select(Move).where(col(Move.ticker) == _norm_ticker(ticker))
     if filters.start is not None:
         statement = statement.where(col(Move.date) >= filters.start)
@@ -187,9 +205,8 @@ def list_moves(session: Session, ticker: str, filters: MoveFilters) -> list[Move
         ).where(
             func.coalesce(col(Explanation.primary_category), col(Move.routing)) == filters.category
         )
-    statement = statement.order_by(
-        nulls_last(func.abs(col(Move.ret_z)).desc()), col(Move.date).desc()
-    )
+    ranked = col(Move.ret_z) if filters.order == "z" else col(Move.ret)
+    statement = statement.order_by(nulls_last(func.abs(ranked).desc()), col(Move.date).desc())
     if filters.limit > 0:
         statement = statement.limit(filters.limit)
     return list(session.exec(statement).all())

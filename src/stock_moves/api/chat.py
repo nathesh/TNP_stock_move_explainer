@@ -62,6 +62,7 @@ _CHAT_ROLES = frozenset({"user", "assistant"})
 
 #: Tool defaults, matching the `default` values advertised in `TOOL_SPECS`.
 _MOVES_LIMIT = 10
+_MOVES_ORDER = "z"
 _ARTICLES_LIMIT = 10
 
 #: Headlines attached to each move in a *list*. Three is what fits in a
@@ -133,6 +134,19 @@ def _as_direction(value: Any) -> str | None:
     return direction if direction in {"up", "down"} else None
 
 
+def _as_order(value: Any) -> str:
+    """`z` / `pct`, defaulting to `z`.
+
+    A model is as free to invent an ordering as it is a direction, and an
+    unknown one should fall back to the documented default rather than raise
+    out of the tool -- the answer is still correct, just ranked the usual way.
+    """
+    if value is None:
+        return _MOVES_ORDER
+    order = str(value).strip().lower()
+    return order if order in {"z", "pct"} else _MOVES_ORDER
+
+
 def _as_text(value: Any) -> str | None:
     """A non-empty search string, or `None`."""
     if value is None:
@@ -158,8 +172,8 @@ def make_tools(session: Session, default_ticker: str | None) -> dict[str, ToolFn
         """Biggest moves for the ticker, with each cached explanation.
 
         Both thresholds are zeroed: every stored move is already a move, so
-        the ordering by `abs(ret_z)` and `limit` do the selecting. Re-applying
-        the detection thresholds here would hide moves the ingest flagged.
+        `order` and `limit` do the selecting. Re-applying the detection
+        thresholds here would hide moves the ingest flagged.
         """
         ticker = _resolve_ticker(kwargs, default_ticker)
         filters = MoveFilters(
@@ -169,6 +183,7 @@ def make_tools(session: Session, default_ticker: str | None) -> dict[str, ToolFn
             pct_threshold=0.0,
             direction=_as_direction(kwargs.get("direction")),
             limit=_as_limit(kwargs.get("limit"), _MOVES_LIMIT),
+            order=_as_order(kwargs.get("order")),
         )
         company = get_company(session, ticker)
         return [

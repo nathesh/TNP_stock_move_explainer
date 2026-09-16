@@ -289,6 +289,30 @@ def test_limit(seeded: Seeded, session: Session) -> None:
     assert _labels(list_moves(session, TICKER, MoveFilters(limit=2))) == ["f", "b"]
 
 
+def test_order_z_ranks_by_how_unusual_the_day_was(seeded: Seeded, session: Session) -> None:
+    """The default: `c` (|z| 1.2, |ret| 0.01) outranks `e` (|z| 0.5, |ret|
+    0.025) because it was the more unusual day, not the bigger one."""
+    filters = MoveFilters(z_threshold=0.0, pct_threshold=0.0, order="z")
+    assert _labels(list_moves(session, TICKER, filters)) == ["f", "b", "a", "d", "c", "e"]
+
+
+def test_order_pct_ranks_by_the_size_of_the_move(seeded: Seeded, session: Session) -> None:
+    """The same six rows, ranked by |ret| instead: `e` and `c` swap, which is
+    the disagreement a "biggest fall" question turns on."""
+    filters = MoveFilters(z_threshold=0.0, pct_threshold=0.0, order="pct")
+    assert _labels(list_moves(session, TICKER, filters)) == ["f", "b", "a", "d", "e", "c"]
+
+
+def test_order_pct_leads_with_the_largest_move(seeded: Seeded, session: Session) -> None:
+    rows = list_moves(session, TICKER, MoveFilters(order="pct", limit=1))
+    assert [row.ret for row in rows] == [pytest.approx(0.08)]
+
+
+def test_an_unknown_order_raises(seeded: Seeded, session: Session) -> None:
+    with pytest.raises(ValueError, match="order must be one of"):
+        list_moves(session, TICKER, MoveFilters(order="vol"))
+
+
 def test_get_move(seeded: Seeded, session: Session) -> None:
     move = get_move(session, "test", date(2025, 8, 1))
     assert move is not None

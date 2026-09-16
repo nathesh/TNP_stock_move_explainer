@@ -151,7 +151,7 @@ tasks:
          TOOL_SPECS: list[dict[str, Any]]   # Anthropic tool format: {"name", "description", "input_schema"}
            list_moves: {ticker: string (optional, defaults to the session ticker), start: string YYYY-MM-DD opt,
                         end: string opt, direction: "up"|"down" opt, limit: integer opt default 10}
-             description: "Largest daily moves for a ticker, sorted by absolute z-score, with the cached
+             description: "The ticker's notable daily moves, ranked by `order` (z: most unusual for the stock; pct: largest percentage), with the cached
                            explanation summary when one exists."
            get_move: {ticker: string opt, date: string YYYY-MM-DD required}
              description: "One move with its decomposition, linked articles and explanation."
@@ -194,7 +194,7 @@ tasks:
          chat: rule-based single tool call. ticker = the `ticker` arg, else the first whole-word match of
            r"\b[A-Z]{2,5}\b" in the last user turn that is not in a stoplist {"I","A","THE","WHY","DID","WHAT",
            "HOW","IS","IT","ON","IN","OF","TO","AND","OR","FOR","USD","CEO","AI","US","ETF"}; if none, reply
-           "Tell me a ticker, e.g. 'why did NVDA drop on 2025-08-28?'" with no tool calls. date = first
+           "Tell me a ticker, e.g. 'why did NVDA drop on 2026-01-20?'" with no tool calls. date = first
            r"\d{4}-\d{2}-\d{2}" match. If "news" or "headline" in the text -> search_news(ticker=..., limit=10);
            elif date -> get_move(ticker, date); else list_moves(ticker, direction=("down" if any of drop/fall/
            down/plunge/sank in text else "up" if any of jump/rise/up/rally/soar else None), limit=5).
