@@ -124,16 +124,20 @@ _COUNT_WORDS: tuple[str, ...] = (
 #: (v1.5 decision 10). Matched whole-word on the normalised text, so "country"
 #: does not fire on "countryside" and "rival" does not fire on "rivalry", and
 #: both the singular and the plural of each noun are listed because whole-word
-#: matching gives no stemming. "depend on" is two tokens with one space, which
-#: is what `_normalise` leaves behind.
+#: matching gives no stemming — and so, for the same reason, is the third-person
+#: form of each verb: "Who competes with NVDA?" is the same question as "Who
+#: does NVDA compete with?" and has to route the same way. "depend on" is two
+#: tokens with one space, which is what `_normalise` leaves behind.
 _RELATION_WORDS: tuple[str, ...] = (
     "compete",
+    "competes",
     "competitor",
     "competitors",
     "rival",
     "rivals",
     "supplier",
     "suppliers",
+    "supplies",
     "customer",
     "customers",
     "exposure",
@@ -144,6 +148,7 @@ _RELATION_WORDS: tuple[str, ...] = (
     "relations",
     "related",
     "depend on",
+    "depends",
     "peers",
 )
 

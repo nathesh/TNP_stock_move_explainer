@@ -688,6 +688,20 @@ def test_a_relations_question_reaches_get_relations() -> None:
         assert payload == {"ticker": "TEST"}
 
 
+def test_the_third_person_phrasing_reaches_get_relations_too() -> None:
+    """Whole-word matching gives no stemming, so "competes" has to be listed
+    next to "compete": "Who competes with TEST?" is the same question asked the
+    other way round and used to fall through to `list_moves`."""
+    for message in (
+        "Who competes with TEST?",
+        "who supplies TEST?",
+        "TEST depends on which chipmakers?",
+    ):
+        name, payload = _routed(message)
+        assert name == "get_relations", message
+        assert payload == {"ticker": "TEST"}
+
+
 def test_news_still_wins_over_a_relations_word() -> None:
     """A question that says "news" wants headlines even when it also names a
     relation, so the news branch stays first in the router."""

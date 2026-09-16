@@ -11,13 +11,18 @@ country — plus the columns the relationship layer stores on existing rows:
 `macro_driver` / `macro_driver_component` on `prices` and `moves`, `sub_routing`
 / `rival_comove` / `chain_comove` on `moves`, and `geo_gate` on `move_articles`.
 
-**There are no migrations here.** The schema is created by
-`SQLModel.metadata.create_all`, which creates missing *tables* but never adds a
-column to a table that already exists. A `data/app.db` written by v1 therefore
-keeps the v1 columns and every v1.5 read of it fails. Delete `data/app.db` and
-let the next request rebuild it, or re-ingest each ticker with `?refresh=true`
-against a fresh file. The same applies to the deployment snapshot
-`data/snapshot.db.gz`, which is rebuilt at the end of v1.5.
+**An older database upgrades in place.** `SQLModel.metadata.create_all` creates
+missing *tables* but never adds a column to a table that already exists, so
+`db.init_db` follows it with `db.migrate_schema`, which compares this module's
+columns against `PRAGMA table_info` and adds every missing nullable column with
+`ALTER TABLE ... ADD COLUMN` on open. A `data/app.db` written by v1 therefore
+gains the v1.5 columns the first time any entry point opens it — the app
+lifespan, the scripts, a seeded cold start — with the old rows left null, and
+re-ingesting a ticker with `?refresh=true` fills them in. The same applies to
+the deployment snapshot `data/snapshot.db.gz`, which is rebuilt at the end of
+v1.5. Only a `NOT NULL` column with no default would need a rebuild instead:
+SQLite cannot add one to a table that already has rows, and `migrate_schema`
+raises `SchemaMigrationError` rather than skip it in silence.
 """
 
 from __future__ import annotations

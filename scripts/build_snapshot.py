@@ -1,15 +1,21 @@
 """Build the committed demo snapshot: `data/snapshot.db.gz`.
 
-**Rerun this after v1.5.** The schema gained tables (`company_edges`,
-`geo_events`) and columns (`sub_routing`, `macro_driver`,
-`macro_driver_component`, `rival_comove`, `chain_comove` on `moves`;
-`macro_driver` and `macro_driver_component` on `prices`; `geo_gate` on
-`move_articles`), and the committed snapshot predates all of them: it holds one
-year of data with null regimes, built when `PERIOD` was `1y`. Schema creation is
-`init_db()`, i.e. the app's own `SQLModel.metadata.create_all`, so the new
-tables appear by themselves — but `create_all` adds *tables*, never columns to
-an existing one, so a v1 `data/snapshot.db` left in place would be reused and
-would fail on the new columns. Delete `data/snapshot.db` before the rebuild.
+**What is committed today.** The snapshot in `data/snapshot.db.gz` was rebuilt
+for v1.5: 110 tickers, two years of prices each, carrying every v1.5 table
+(`company_edges`, `geo_events`) and every v1.5 column (`sub_routing`,
+`macro_driver`, `macro_driver_component`, `rival_comove`, `chain_comove` on
+`moves`; `macro_driver` and `macro_driver_component` on `prices`; `geo_gate` on
+`move_articles`). It was built **without a key**, so its explanations are
+templated and its edges are only the `competitor` rows the sector ETF's
+holdings give and the `factor` rows fitted from prices — there are no
+`supplier`, `customer` or `country` edges, and therefore no `geo_events` rows.
+A rebuild with a working key is what would add them.
+
+Schema creation is `init_db()`, which runs `create_all` and then
+`migrate_schema`, so an older `data/snapshot.db` left in place is upgraded on
+open rather than failing on the new columns. It is still reused as-is, and a
+ticker that already has prices is skipped, so delete `data/snapshot.db` when
+the rebuild is meant to refetch everything rather than resume.
 
 Ingests a broad, liquid slice of the US large-cap market — every sector the
 routing logic can choose between — and gzips the resulting SQLite file so a
