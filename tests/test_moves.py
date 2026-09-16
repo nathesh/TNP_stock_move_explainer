@@ -17,6 +17,7 @@ from synth import synthetic_market, synthetic_ohlcv
 
 from stock_moves.macro_calendar import CPI_DATES, FOMC_DATES
 from stock_moves.moves import (
+    FACTOR_COLUMNS,
     FEATURE_COLUMNS,
     OHLCV_COLUMNS,
     build_features,
@@ -36,6 +37,13 @@ N_DAYS = 320
 SHOCK_POSITION = 250
 SHOCK_RETURN = -0.08
 EARNINGS_POSITION = 100
+
+# Roughly the number of trading days yfinance returns for `period="2y"`, which is
+# the default since v1.5 (`Settings.default_period`).
+TWO_YEAR_DAYS = 504
+ONE_YEAR_DAYS = 252
+# `regime`'s slow SMA window: the first `REGIME_SLOW_WINDOW - 1` rows are unlabelled.
+REGIME_SLOW_WINDOW = 200
 
 
 @pytest.fixture(scope="module")
@@ -71,7 +79,7 @@ def features(stock: pd.DataFrame, spy: pd.DataFrame, etf: pd.DataFrame) -> pd.Da
 def test_build_features_has_exactly_the_designed_columns(
     features: pd.DataFrame, stock: pd.DataFrame, spy: pd.DataFrame, etf: pd.DataFrame
 ) -> None:
-    expected = list(OHLCV_COLUMNS) + list(FEATURE_COLUMNS)
+    expected = list(OHLCV_COLUMNS) + list(FEATURE_COLUMNS) + list(FACTOR_COLUMNS)
     assert list(features.columns) == expected
 
     joined = stock.index.intersection(spy.index).intersection(etf.index)
@@ -104,9 +112,40 @@ def test_build_features_without_an_etf_leaves_regime_sector_none(
     stock: pd.DataFrame, spy: pd.DataFrame
 ) -> None:
     features = build_features(stock, spy, None)
-    assert list(features.columns) == list(OHLCV_COLUMNS) + list(FEATURE_COLUMNS)
+    assert list(features.columns) == list(OHLCV_COLUMNS) + list(FEATURE_COLUMNS) + list(
+        FACTOR_COLUMNS
+    )
     assert features["regime_sector"].isna().all()
     assert features["regime_mkt"].notna().any()
+
+
+def test_build_features_over_two_years_labels_the_regime_after_the_warm_up() -> None:
+    """Why `Settings.default_period` is `2y`: a 1y window is mostly regime-less.
+
+    `regime` needs a 200-day SMA, so the first 199 rows of any window carry no
+    label at all. Over two years that warm-up is a fifth of the sample and the
+    rest is labelled; over one year it is four fifths of it.
+    """
+    stock = synthetic_ohlcv(n_days=TWO_YEAR_DAYS, seed=5)
+    stock_ret = stock["close"].pct_change()
+    spy = synthetic_market(TWO_YEAR_DAYS, seed=6, correlate_with=stock_ret, beta=0.9)
+    etf = synthetic_market(TWO_YEAR_DAYS, seed=7, correlate_with=stock_ret, beta=0.6)
+
+    features = build_features(stock, spy, etf)
+    assert len(features) == TWO_YEAR_DAYS
+
+    regime_mkt = features["regime_mkt"]
+    assert regime_mkt.iloc[: REGIME_SLOW_WINDOW - 1].isna().all()
+    assert regime_mkt.iloc[REGIME_SLOW_WINDOW - 1 :].notna().all()
+    assert set(regime_mkt.dropna()) <= {"bull", "bear"}
+    assert features["regime_sector"].iloc[REGIME_SLOW_WINDOW - 1 :].notna().all()
+
+    # Most of a 2y window is labelled; most of a 1y window is not.
+    assert regime_mkt.notna().mean() > 0.5
+    one_year = build_features(
+        stock.iloc[:ONE_YEAR_DAYS], spy.iloc[:ONE_YEAR_DAYS], etf.iloc[:ONE_YEAR_DAYS]
+    )
+    assert one_year["regime_mkt"].notna().mean() < 0.25
 
 
 # --------------------------------------------------------------------------

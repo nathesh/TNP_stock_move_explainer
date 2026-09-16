@@ -26,6 +26,7 @@ __all__ = [
     "ExplanationResult",
     "ModelProvider",
     "MoveContext",
+    "Relations",
     "ToolCallRecord",
     "ToolFn",
 ]
@@ -81,6 +82,65 @@ class ArticleInput:
         )
 
 
+def _str_tuple(obj: Any, name: str) -> tuple[str, ...]:
+    """Read `name` off `obj` as a tuple of strings; `()` when absent or not a
+    sequence of its own (a bare string is not a list of tickers)."""
+    value = getattr(obj, name, None)
+    if value is None or isinstance(value, str):
+        return ()
+    try:
+        return tuple(str(item) for item in value)
+    except TypeError:
+        return ()
+
+
+def _weighted_tuple(obj: Any, name: str) -> tuple[tuple[str, float], ...]:
+    """Read `name` off `obj` as `(code, weight)` pairs, skipping anything that
+    is not a two-item pair with a numeric weight."""
+    value = getattr(obj, name, None)
+    if value is None or isinstance(value, str):
+        return ()
+    pairs: list[tuple[str, float]] = []
+    try:
+        items = list(value)
+    except TypeError:
+        return ()
+    for item in items:
+        if isinstance(item, str):
+            continue
+        try:
+            code, weight = item
+        except (TypeError, ValueError):
+            continue
+        try:
+            pairs.append((str(code), float(weight)))
+        except (TypeError, ValueError):
+            continue
+    return tuple(pairs)
+
+
+@dataclass(frozen=True)
+class Relations:
+    """One model call's worth of typed facts about a company (v1.5 decision 3).
+
+    The four fields are the model-suggested half of `company_edges`: the first
+    three are ticker lists for the `competitor`, `supplier` and `customer`
+    relations, and `countries` is the `country` relation, each entry an ISO-3166
+    alpha-2 code with a revenue-or-supply weight in [0, 1] whose total is at
+    most 1. The `factor` relation is deliberately absent: factor exposure comes
+    from prices, not from the model (v1.5 decision 4).
+
+    Empty is a valid answer and the keyless one: `HeuristicProvider` returns
+    exactly that, which is what makes the geopolitical gate unopenable without
+    a key.
+    """
+
+    competitors: tuple[str, ...]
+    suppliers: tuple[str, ...]
+    customers: tuple[str, ...]
+    countries: tuple[tuple[str, float], ...]  # (ISO alpha-2, weight 0-1, sum <= 1)
+
+
 @dataclass(frozen=True)
 class MoveContext:
     """Everything quantitative that is known about a move before any article
@@ -113,13 +173,49 @@ class MoveContext:
     near_fomc: bool = False
     near_cpi: bool = False
 
+    # --- v1.5: the relationship layer -------------------------------------- #
+    # All defaulted and all at the end, because a dataclass cannot put a
+    # defaulted field before an undefaulted one and v1's fields have no
+    # defaults. A v1 caller that knows none of this keeps working unchanged.
+
+    #: "share_shift" | "supply_chain" | "oil" | "dollar" | "rates" | "gold" |
+    #: "country:XX", or None when no rule fired (v1.5 decision 6).
+    sub_routing: str | None = None
+    #: The factor proxy with the largest absolute contribution that day, or
+    #: None when no proxy itself moved (v1.5 decision 4).
+    macro_driver: str | None = None
+    #: That driver's contribution to the day's return, as a return.
+    macro_driver_component: float | None = None
+    #: Same-day co-movement of the `competitor` edges, and of the
+    #: `supplier`/`customer` edges: the two inputs to `sub_routing`.
+    rival_comove: float | None = None
+    chain_comove: float | None = None
+    #: The company's typed edges, as `Relations` carries them.
+    competitors: tuple[str, ...] = ()
+    suppliers: tuple[str, ...] = ()
+    customers: tuple[str, ...] = ()
+    countries: tuple[tuple[str, float], ...] = ()
+    #: Rendered geopolitical headline counts for the move's window, one line
+    #: per `(date, country)`: "2025-04-03 CN 14 headlines: <title>". Rendered
+    #: by the caller, because `geo_events` is its own table and this module
+    #: does not know the table classes.
+    geo_events: tuple[str, ...] = ()
+
     @classmethod
     def from_objects(cls, move: Any, company: Any) -> MoveContext:
         """Build from a `moves` row (or a prices row) plus a `companies` row.
 
         Everything is read with `getattr(obj, name, None)`, so a caller may
         pass a joined object, a SimpleNamespace, or a row that is missing the
-        newer columns.
+        newer columns. That is what lets one constructor serve both the v1 and
+        the v1.5 `Move` model: the v1.5 columns (`sub_routing`, `macro_driver`,
+        `macro_driver_component`, `rival_comove`, `chain_comove`) simply read
+        as None against a v1 row.
+
+        The edge fields are read off `company`, not `move`, because they are
+        facts about the company; `geo_events` is read off `move`, because it is
+        dated. Both are attached by the caller — `company_edges` and
+        `geo_events` are separate tables and this module knows no tables.
         """
         ticker = str(getattr(move, "ticker", None) or getattr(company, "ticker", None) or "")
         ret = _req_float(move, "ret")
@@ -148,6 +244,16 @@ class MoveContext:
             peer_comove=_opt_float(move, "peer_comove"),
             near_fomc=bool(getattr(move, "near_fomc", False)),
             near_cpi=bool(getattr(move, "near_cpi", False)),
+            sub_routing=_opt_str(move, "sub_routing"),
+            macro_driver=_opt_str(move, "macro_driver"),
+            macro_driver_component=_opt_float(move, "macro_driver_component"),
+            rival_comove=_opt_float(move, "rival_comove"),
+            chain_comove=_opt_float(move, "chain_comove"),
+            competitors=_str_tuple(company, "competitors"),
+            suppliers=_str_tuple(company, "suppliers"),
+            customers=_str_tuple(company, "customers"),
+            countries=_weighted_tuple(company, "countries"),
+            geo_events=_str_tuple(move, "geo_events"),
         )
 
 
@@ -255,6 +361,15 @@ _MOVE_SHAPE = (
     "primary_category, confidence, cited_article_ids, unexplained} or null}."
 )
 _ARTICLE_SHAPE = "Each article is {id, title, source, url, published_at, relevance, category}."
+_EDGE_SHAPE = (
+    "Each edge is {dst, relation, weight, source}. `relation` is one of "
+    "'competitor', 'supplier', 'customer', 'country' or 'factor'. `dst` is a "
+    "ticker for the first three, an ISO-3166 alpha-2 country code for "
+    "'country', and a factor name ('oil', 'dollar', 'rates', 'gold') for "
+    "'factor'. `weight` is that source's strength, not a probability. "
+    "`source` is 'model' (a language model named it), 'etf_holdings' (the "
+    "sector ETF's top holdings) or 'prices' (a fitted exposure)."
+)
 
 TOOL_SPECS: list[dict[str, Any]] = [
     {
@@ -321,6 +436,28 @@ TOOL_SPECS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "get_relations",
+        "description": (
+            "The company's stored relationship edges: its competitors, "
+            "suppliers, customers, countries of exposure and price-derived "
+            "factor exposures. Use it to say who a move was shared with, or "
+            "which country or commodity a company is exposed to. Returns "
+            "{ticker, edges: [...]}. " + _EDGE_SHAPE + " An empty `edges` "
+            "means none are stored for that ticker, which is the expected "
+            "answer when the app is running without a model key."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ticker": {
+                    "type": "string",
+                    "description": "Defaults to the session ticker.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "search_news",
         "description": (
             "Headlines linked to a ticker's moves, filtered by a substring of "
@@ -379,6 +516,19 @@ class ModelProvider(Protocol):
         self, ticker: str, name: str, sector: str | None, industry: str | None
     ) -> list[str]:
         """Peer tickers for the company ontology; may be empty."""
+        ...
+
+    def suggest_relations(
+        self, ticker: str, name: str, sector: str | None, industry: str | None
+    ) -> Relations:
+        """The company's typed edges in one call (v1.5 decision 3).
+
+        Competitors, suppliers and customers as tickers; countries as ISO-3166
+        alpha-2 codes with weights. Every field may be empty, and the keyless
+        provider returns all four empty — so without a key the geopolitical
+        gate can never open, which is the honest behaviour rather than a
+        limitation to hide.
+        """
         ...
 
     def chat(

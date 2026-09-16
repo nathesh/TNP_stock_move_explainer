@@ -467,7 +467,8 @@ def test_article_input_from_object() -> None:
 
 def test_tool_specs_cover_the_three_read_functions() -> None:
     names = [spec["name"] for spec in TOOL_SPECS]
-    assert names == ["list_moves", "get_move", "search_news"]
+    # v1.5 adds `get_relations` alongside the three v1 read functions.
+    assert names == ["list_moves", "get_move", "get_relations", "search_news"]
     for spec in TOOL_SPECS:
         assert spec["input_schema"]["type"] == "object"
         assert spec["description"]

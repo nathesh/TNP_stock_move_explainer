@@ -33,7 +33,10 @@ class Settings(BaseModel):
     anthropic_model: str = "claude-sonnet-5"
     news_source: str = "google_rss"
     db_path: Path = Path("data/app.db")
-    default_period: str = "1y"
+    # Two years, not one: `regime` needs a 200-day SMA before it can label a
+    # day bull or bear, so a 1y window left the first four months of every
+    # ingest with a null regime and the tail of it barely warmed up.
+    default_period: str = "2y"
     default_top_n: int = 10
     default_z_threshold: float = 2.0
     default_pct_threshold: float = 0.02

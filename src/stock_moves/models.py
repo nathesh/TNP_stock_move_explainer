@@ -1,9 +1,23 @@
-"""SQLModel tables — the whole data model of v1.
+"""SQLModel tables — the whole data model of v1 and the v1.5 relationship layer.
 
 Columns follow `docs/architecture-v1.md`. Derived quantities (returns, z-scores,
 the OLS decomposition, routing, regimes, event proximity) are *stored as
 columns* on `prices` and copied onto `moves`, so every API filter is a `WHERE`
 on a stored value and changing a threshold never means recomputing anything.
+
+v1.5 (`docs/v1.5-plan.md`) adds two tables — `company_edges`, the one typed-fact
+table per company, and `geo_events`, dated geopolitical headline counts per
+country — plus the columns the relationship layer stores on existing rows:
+`macro_driver` / `macro_driver_component` on `prices` and `moves`, `sub_routing`
+/ `rival_comove` / `chain_comove` on `moves`, and `geo_gate` on `move_articles`.
+
+**There are no migrations here.** The schema is created by
+`SQLModel.metadata.create_all`, which creates missing *tables* but never adds a
+column to a table that already exists. A `data/app.db` written by v1 therefore
+keeps the v1 columns and every v1.5 read of it fails. Delete `data/app.db` and
+let the next request rebuild it, or re-ingest each ticker with `?refresh=true`
+against a fresh file. The same applies to the deployment snapshot
+`data/snapshot.db.gz`, which is rebuilt at the end of v1.5.
 """
 
 from __future__ import annotations
@@ -14,15 +28,29 @@ from datetime import UTC, date, datetime
 from sqlmodel import Field, SQLModel, UniqueConstraint
 
 __all__ = [
+    "EDGE_RELATIONS",
+    "EDGE_SOURCES",
     "Article",
     "ChatMessage",
     "Company",
+    "CompanyEdge",
     "Explanation",
+    "GeoEvent",
     "Move",
     "MoveArticle",
     "Price",
     "utcnow",
 ]
+
+# `company_edges.relation` — `dst` is a ticker for the first three, an ISO-3166
+# alpha-2 code for "country", and a factor name (oil/dollar/rates/gold) for
+# "factor". Documented here rather than enforced: SQLite has no enum type and a
+# CHECK constraint would need a migration to widen.
+EDGE_RELATIONS: tuple[str, ...] = ("competitor", "supplier", "customer", "country", "factor")
+
+# `company_edges.source` — "model" is one `suggest_relations` provider call,
+# "etf_holdings" the keyless competitor fallback, "prices" the fitted factor betas.
+EDGE_SOURCES: tuple[str, ...] = ("model", "etf_holdings", "prices")
 
 # `date` is itself a column name on `prices` and `moves`, which shadows the
 # imported `date` type inside those class bodies; annotate with this alias.
@@ -60,6 +88,28 @@ class Company(SQLModel, table=True):
         return [str(peer) for peer in parsed]
 
 
+class CompanyEdge(SQLModel, table=True):
+    """One typed fact about a company: `(src, dst, relation)` is the whole key.
+
+    v1.5 decision 1 — every relationship is a row here, not a column anywhere
+    else. `relation` is one of `EDGE_RELATIONS` and `source` one of
+    `EDGE_SOURCES`; `weight` is the strength the source reported (a model
+    confidence, an ETF holding share, or a fitted beta), defaulting to 1.0 for
+    sources that state a fact without a number. `competitor` replaces the idea
+    of a peer: `companies.peers_json` stays only as the keyless ETF fallback.
+    """
+
+    __tablename__ = "company_edges"
+
+    src: str = Field(primary_key=True, index=True)
+    dst: str = Field(primary_key=True)
+    relation: str = Field(primary_key=True)  # one of EDGE_RELATIONS
+
+    weight: float = 1.0
+    source: str  # one of EDGE_SOURCES
+    updated_at: datetime = Field(default_factory=utcnow)
+
+
 class Price(SQLModel, table=True):
     """One trading day of OHLCV plus everything derived from it."""
 
@@ -86,6 +136,13 @@ class Price(SQLModel, table=True):
     sector_component: float | None = None
     idio_component: float | None = None
     routing: str | None = None
+
+    # v1.5: the factor-proxy attribution, a second and separate step from the
+    # SPY-plus-sector OLS above. `macro_driver` is the proxy with the largest
+    # absolute contribution among proxies that themselves moved that day
+    # ("oil" | "dollar" | "rates" | "gold" | "country:XX"), `None` if none did.
+    macro_driver: str | None = None
+    macro_driver_component: float | None = None
 
     regime_mkt: str | None = None
     regime_sector: str | None = None
@@ -116,6 +173,13 @@ class Move(SQLModel, table=True):
     idio_component: float | None = None
     routing: str
 
+    # v1.5: routing keeps its three buckets; the sub-bucket says which story.
+    # "share_shift" | "supply_chain" | "oil" | "dollar" | "rates" | "gold" |
+    # "country:XX", or None when no rule fires.
+    sub_routing: str | None = None
+    macro_driver: str | None = None
+    macro_driver_component: float | None = None
+
     direction: str  # "up" | "down"
 
     regime_mkt: str | None = None
@@ -126,6 +190,10 @@ class Move(SQLModel, table=True):
     near_cpi: bool = False
 
     peer_comove: float | None = None
+    # v1.5: same-day co-movement of the `competitor` edges and of the
+    # `supplier`/`customer` edges, the two inputs to `sub_routing`.
+    rival_comove: float | None = None
+    chain_comove: float | None = None
     created_at: datetime = Field(default_factory=utcnow)
 
 
@@ -144,12 +212,53 @@ class Article(SQLModel, table=True):
     fetched_at: datetime = Field(default_factory=utcnow)
 
 
+class GeoEvent(SQLModel, table=True):
+    """Dated geopolitical headline counts for one country, from one news source.
+
+    v1.5 decision 5 — the GDELT Events feed is out of scope, so a "geo event" is
+    how loudly a country was in the news that day: the hit count for the geo
+    vocabulary query, with a few titles kept for citation. Built only for
+    countries a company has a `country` edge to, and only when a move exists, so
+    the table stays small. Re-querying the same `(date, country, news_source)`
+    updates the row rather than inserting a second count.
+    """
+
+    __tablename__ = "geo_events"
+    __table_args__ = (
+        UniqueConstraint("date", "country", "news_source", name="uq_geo_event_date_country_source"),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+    date: DateT = Field(index=True)
+    country: str = Field(index=True)  # ISO-3166 alpha-2
+
+    headline_count: int
+    sample_titles_json: str = "[]"
+    news_source: str  # "google_rss" | "gdelt"
+    fetched_at: datetime = Field(default_factory=utcnow)
+
+    @property
+    def sample_titles(self) -> list[str]:
+        """Kept headlines decoded from `sample_titles_json`; `[]` if unset or malformed."""
+        try:
+            parsed = json.loads(self.sample_titles_json or "[]")
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(parsed, list):
+            return []
+        return [str(title) for title in parsed]
+
+
 class MoveArticle(SQLModel, table=True):
     """Move-to-article link with the scored relevance and its five components.
 
     `relevance` is the weighted sum of the components (0.35 bucket_match,
     0.20 entity_match, 0.15 timing, 0.15 source_tier, 0.15 coverage), or the
     mean of that sum and `model_score` when a model key was present.
+
+    v1.5 adds `geo_gate`, which is not one of the weighted components: it is a
+    post-hoc cap recorded after the sum, so the stored components still explain
+    the score they produced.
     """
 
     __tablename__ = "move_articles"
@@ -168,6 +277,9 @@ class MoveArticle(SQLModel, table=True):
     coverage: float = 0.0
     timing_kind: str | None = None  # "cause" | "report"
     model_score: float | None = None
+    # v1.5 decision 7: 1.0 the geo gate opened, 0.0 it closed and `relevance`
+    # was capped, None the article never matched the geo vocabulary.
+    geo_gate: float | None = None
 
 
 class Explanation(SQLModel, table=True):

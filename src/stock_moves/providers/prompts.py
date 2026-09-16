@@ -25,22 +25,41 @@ from stock_moves.providers.base import ArticleInput, ArticleScore, MoveContext
 __all__ = [
     "CHAT_SYSTEM",
     "EXPLAIN_SYSTEM",
+    "MAX_COUNTRIES",
+    "MAX_PEERS",
+    "MAX_SUPPLY_CHAIN",
     "PEERS_SYSTEM",
+    "RELATIONS_SYSTEM",
     "SCORE_SYSTEM",
     "Explanation",
     "Peers",
+    "RelationsOut",
     "Scores",
     "article_line",
     "chat_system",
     "clamp",
+    "clean_tickers",
     "explain_prompt",
     "move_block",
     "narrative_block",
+    "normalise_countries",
     "openai_tools",
     "peers_prompt",
+    "relations_prompt",
     "score_prompt",
     "scored_line",
 ]
+
+MAX_PEERS = 6
+"""Competitors, and peers before them: the list the prompt asks for and the
+cut the caller applies, stated once so the two cannot drift."""
+
+MAX_SUPPLY_CHAIN = 4
+"""Suppliers, and customers: fewer than competitors, because a company has
+many rivals and only a handful of *public* counterparties worth naming."""
+
+MAX_COUNTRIES = 5
+"""Country edges. Weights across them sum to at most 1 (v1.5 decision 3)."""
 
 _CATEGORY = Literal["company", "industry", "macro"]
 _PRIMARY_CATEGORY = Literal["company", "industry", "macro", "unexplained"]
@@ -71,6 +90,27 @@ class Explanation(BaseModel):
 
 class Peers(BaseModel):
     tickers: list[str]
+
+
+class _CountryWeight(BaseModel):
+    country: str
+    weight: float
+
+
+class RelationsOut(BaseModel):
+    """The `suggest_relations` structured output, before any cleaning.
+
+    Named `RelationsOut` rather than `Relations` because the cleaned, frozen
+    dataclass in `base.py` owns that name: this is what the model said, that is
+    what the app stores. Everything here is a plain list so a model that
+    returns nothing for a field returns an empty list rather than failing
+    validation.
+    """
+
+    competitors: list[str] = []
+    suppliers: list[str] = []
+    customers: list[str] = []
+    countries: list[_CountryWeight] = []
 
 
 # --------------------------------------------------------------------------- #
@@ -126,6 +166,32 @@ PEERS_SYSTEM = (
     "ETFs, no indices, no private companies, and never the company's own "
     "ticker. Closest competitors first; return fewer, or none, rather than "
     "padding the list."
+)
+
+RELATIONS_SYSTEM = (
+    "You name a company's business relationships, for a system that uses them "
+    "to decide which other tickers and which countries to look at when that "
+    "company's stock moves.\n\n"
+    f"Return up to {MAX_PEERS} direct competitors as US-listed ticker symbols, "
+    "closest first. A competitor sells a substitute to the same buyers; a "
+    "company merely in the same sector is not one.\n\n"
+    f"Return up to {MAX_SUPPLY_CHAIN} suppliers and up to {MAX_SUPPLY_CHAIN} "
+    "customers, also as ticker symbols. A supplier sells this company an input "
+    "it depends on; a customer buys enough from it to matter to its revenue. "
+    "Public companies only: if the important counterparty is private, "
+    "state-owned or a subsidiary with no listing of its own, omit it rather "
+    "than naming the parent or writing the name out in words.\n\n"
+    f"Return up to {MAX_COUNTRIES} countries as ISO-3166 alpha-2 codes ('TW', "
+    "'CN', 'DE'), each with a weight in [0, 1] for the share of revenue or of "
+    "critical supply that depends on that country. The weights must sum to at "
+    "most 1; they are shares of the whole company, not shares of each other, "
+    "so a domestic company's weights are small and need not add up to 1. "
+    "Include a country only where a disruption there would move this stock.\n\n"
+    "All tickers in upper case, no ETFs, no indices, and never the company's "
+    "own ticker in any of the three lists. Return fewer, or an empty list, "
+    "rather than padding: an empty list is a correct answer and a guessed one "
+    "is not, because every entry here becomes a stored edge that later credits "
+    "or discredits a headline."
 )
 
 CHAT_SYSTEM = (
@@ -259,6 +325,63 @@ def explain_prompt(move: MoveContext, scored: Sequence[tuple[ArticleInput, Artic
 
 def peers_prompt(ticker: str, name: str, sector: str | None, industry: str | None) -> str:
     return json.dumps({"ticker": ticker, "company": name, "sector": sector, "industry": industry})
+
+
+def relations_prompt(ticker: str, name: str, sector: str | None, industry: str | None) -> str:
+    """The same identity block `peers_prompt` sends; `RELATIONS_SYSTEM` asks
+    for four lists instead of one."""
+    return json.dumps({"ticker": ticker, "company": name, "sector": sector, "industry": industry})
+
+
+# --------------------------------------------------------------------------- #
+# Cleaning a model's relationship answer
+# --------------------------------------------------------------------------- #
+
+
+def clean_tickers(raw: Sequence[Any], self_ticker: str, limit: int) -> tuple[str, ...]:
+    """Upper-case, strip, drop blanks and the company itself, dedupe, cut.
+
+    Shared by both keyed providers so "AMD asked about AMD" and "nvda twice"
+    cannot be handled one way by one vendor and another way by the other.
+    """
+    own = self_ticker.strip().upper()
+    cleaned = (str(item).strip().upper() for item in raw)
+    kept = [candidate for candidate in cleaned if candidate and candidate != own]
+    return tuple(dict.fromkeys(kept))[:limit]
+
+
+def normalise_countries(
+    raw: Sequence[Any], limit: int = MAX_COUNTRIES
+) -> tuple[tuple[str, float], ...]:
+    """`(ISO alpha-2, weight)` pairs obeying the contract in `base.Relations`.
+
+    Each weight is clamped into [0, 1] first; if the clamped weights still sum
+    above 1 they are scaled down *proportionally*, which keeps their ranking
+    and their ratios -- a model that says 60% China and 30% Taiwan means twice
+    as much China either way. Truncating the list instead would silently drop
+    the exposure that the gate rule exists to catch. Codes are upper-cased and
+    deduped on first mention; a non-two-letter code is dropped, since the
+    country-ETF lookup downstream is keyed on alpha-2.
+    """
+    pairs: list[tuple[str, float]] = []
+    seen: set[str] = set()
+    for item in raw:
+        code = str(getattr(item, "country", "") or "").strip().upper()
+        if len(code) != 2 or not code.isalpha() or code in seen:
+            continue
+        try:
+            weight = float(getattr(item, "weight", 0.0))
+        except (TypeError, ValueError):
+            continue
+        seen.add(code)
+        pairs.append((code, clamp(weight)))
+        if len(pairs) == limit:
+            break
+
+    total = sum(weight for _, weight in pairs)
+    if total > 1.0:
+        pairs = [(code, weight / total) for code, weight in pairs]
+    return tuple(pairs)
 
 
 def openai_tools(tool_specs: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:

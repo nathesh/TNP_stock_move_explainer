@@ -401,6 +401,7 @@ def test_the_tools_are_translated_into_openai_shape() -> None:
     assert {tool["function"]["name"] for tool in tools} == {
         "list_moves",
         "get_move",
+        "get_relations",
         "search_news",
     }
     assert all(tool["type"] == "function" for tool in tools)

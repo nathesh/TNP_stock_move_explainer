@@ -24,12 +24,15 @@ import pandas as pd
 from .macro_calendar import CPI_DATES, FOMC_DATES
 
 __all__ = [
+    "FACTOR_COLUMNS",
     "FEATURE_COLUMNS",
     "OHLCV_COLUMNS",
     "build_features",
     "compute_returns",
     "decompose",
     "detect_moves",
+    "factor_betas",
+    "macro_driver",
     "near_dates",
     "near_earnings",
     "peer_comove",
@@ -58,6 +61,20 @@ FEATURE_COLUMNS: tuple[str, ...] = (
     "near_fomc",
     "near_cpi",
 )
+
+#: The two columns :func:`macro_driver` produces (v1.5), kept deliberately
+#: *outside* :data:`FEATURE_COLUMNS`: that tuple is the v1 storage contract
+#: `ingest` is written against, and the factor attribution is a second and
+#: separate pass. ``build_features`` always appends these two to its output — so
+#: the frame is one shape whether or not a factor frame was supplied — and task
+#: R9 wires them into `ingest`'s storage groups, which is where they start being
+#: persisted. Until then they are computed and returned but not stored.
+FACTOR_COLUMNS: tuple[str, ...] = ("macro_driver", "macro_driver_component")
+
+#: A factor is a candidate driver only if its own return that day is this many
+#: trailing standard deviations from flat (v1.5 plan, decision 4). Without the
+#: gate a large beta would nominate a driver out of an ordinary day's noise.
+MACRO_DRIVER_Z_MIN = 1.5
 
 _ROUTE_COMPANY = "company"
 _ROUTE_INDUSTRY = "industry"
@@ -282,6 +299,110 @@ def peer_comove(peer_returns: pd.DataFrame, dates: pd.DatetimeIndex) -> pd.Serie
     return aligned.mean(axis=1, skipna=True).astype(float)
 
 
+def factor_betas(
+    ret: pd.Series,
+    factors: pd.DataFrame,
+    window: int = 60,
+) -> pd.DataFrame:
+    """Trailing univariate OLS beta of ``ret`` on each column of ``factors``.
+
+    One separate regression per factor — ``ret`` on that factor alone, with an
+    intercept — fitted on the ``window`` days ending at ``t-1``, the same
+    look-ahead-free convention as :func:`decompose`. Univariate on purpose: the
+    proxies are correlated (a dollar move and an oil move are not independent),
+    and a joint fit on four collinear ETFs would hand back betas nobody can
+    defend. The v1.5 plan calls this a heuristic and so does this docstring.
+
+    A row is NaN until the full ``window`` of finite pairs is available, so an
+    exposure is never asserted from a half-filled window. Columns and index come
+    out exactly as ``factors.columns`` and ``ret.index``.
+    """
+    index = ret.index
+    n = len(index)
+    y_all = ret.to_numpy(dtype=float)
+    names = [str(name) for name in factors.columns]
+
+    columns: dict[str, np.ndarray] = {}
+    for name, raw_name in zip(names, factors.columns, strict=True):
+        x_all = factors[raw_name].reindex(index).to_numpy(dtype=float)
+        betas = np.full(n, np.nan)
+        for t in range(window, n):
+            lo = t - window
+            y = y_all[lo:t]
+            x = x_all[lo:t]
+            ok = np.isfinite(y) & np.isfinite(x)
+            rows = int(ok.sum())
+            if rows < window:
+                continue
+            design = np.column_stack([np.ones(rows), x[ok]])
+            coef, *_ = np.linalg.lstsq(design, y[ok], rcond=None)
+            betas[t] = coef[1]
+        columns[name] = betas
+
+    return pd.DataFrame(columns, index=index, columns=names, dtype=float)
+
+
+def macro_driver(
+    ret: pd.Series,
+    factors: pd.DataFrame,
+    betas: pd.DataFrame,
+    z_window: int = 20,
+    z_min: float = MACRO_DRIVER_Z_MIN,
+) -> pd.DataFrame:
+    """Name the factor that best accounts for each day, or nothing.
+
+    Per day and per factor the contribution is ``beta[t] * factor_return[t]``:
+    what the stock's measured exposure says that factor did to it. A factor is
+    eligible only when the factor itself had an unusual day —
+    ``abs(rolling_z(factor_return)[t]) >= z_min`` on a ``z_window`` history —
+    and the driver is the eligible factor with the largest absolute
+    contribution. When no factor moved, the driver is None: the honest answer on
+    a quiet macro tape is that nothing macro happened, not the least quiet of
+    four quiet things.
+
+    ``ret`` supplies the index only; the attribution is entirely a statement
+    about the factors and the betas already fitted to them.
+
+    Returns ``macro_driver`` (object dtype, a factor name or None) and
+    ``macro_driver_component`` (float, the signed contribution, NaN where there
+    is no driver) on ``ret``'s index.
+    """
+    index = ret.index
+    n = len(index)
+    names = [str(name) for name in factors.columns if str(name) in set(betas.columns)]
+
+    drivers: list[str | None] = [None] * n
+    components = np.full(n, np.nan)
+
+    if names:
+        contributions = np.full((n, len(names)), np.nan)
+        eligible = np.zeros((n, len(names)), dtype=bool)
+        for j, name in enumerate(names):
+            factor_ret = factors[name].reindex(index).astype(float)
+            beta = betas[name].reindex(index).to_numpy(dtype=float)
+            contribution = beta * factor_ret.to_numpy(dtype=float)
+            z = rolling_z(factor_ret, window=z_window).to_numpy(dtype=float)
+            contributions[:, j] = contribution
+            eligible[:, j] = np.isfinite(contribution) & np.isfinite(z) & (np.abs(z) >= z_min)
+
+        for t in range(n):
+            row = eligible[t]
+            if not row.any():
+                continue
+            magnitude = np.where(row, np.abs(contributions[t]), -np.inf)
+            winner = int(np.argmax(magnitude))
+            drivers[t] = names[winner]
+            components[t] = float(contributions[t, winner])
+
+    return pd.DataFrame(
+        {
+            "macro_driver": pd.Series(drivers, index=index, dtype=object),
+            "macro_driver_component": pd.Series(components, index=index, dtype=float),
+        },
+        index=index,
+    )
+
+
 def build_features(
     stock: pd.DataFrame,
     spy: pd.DataFrame,
@@ -289,13 +410,25 @@ def build_features(
     earnings_dates: Iterable[date] = (),
     z_window: int = 20,
     ols_window: int = 60,
+    *,
+    factors: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Assemble the per-day feature table stored in ``prices``.
 
     Inner-joins ``stock`` with ``spy`` (and ``etf`` when given) so every row has
     a market return to regress against. Output is the OHLCV block of ``stock``
-    plus exactly :data:`FEATURE_COLUMNS`. ``regime_sector`` is None throughout
-    when ``etf`` is None; ``routing`` is None on rows with no return.
+    plus exactly :data:`FEATURE_COLUMNS` and then :data:`FACTOR_COLUMNS`.
+    ``regime_sector`` is None throughout when ``etf`` is None; ``routing`` is
+    None on rows with no return.
+
+    ``factors`` is the optional frame of factor-proxy returns from
+    :func:`stock_moves.prices.fetch_factor_returns`, one column per proxy. It is
+    a **second and separate** attribution: the SPY-plus-sector regression that
+    decides ``routing`` is untouched, and the factor pass only fills
+    :data:`FACTOR_COLUMNS`. Factor rows are aligned to the joined trading
+    days, so a proxy that does not trade on one of them simply has no return
+    that day. Without ``factors`` — every v1 caller — the two columns are still
+    present and empty, which is what keeps the stored schema one shape.
     """
     index = stock.index.intersection(spy.index)
     if etf is not None:
@@ -343,7 +476,21 @@ def build_features(
     out["near_fomc"] = near_dates(index, FOMC_DATES)
     out["near_cpi"] = near_dates(index, CPI_DATES)
 
-    return out[list(OHLCV_COLUMNS) + list(FEATURE_COLUMNS)]
+    if factors is not None and factors.shape[1] > 0:
+        aligned = factors.reindex(index)
+        attribution = macro_driver(
+            out["ret"],
+            aligned,
+            factor_betas(out["ret"], aligned, window=ols_window),
+            z_window=z_window,
+        )
+        out["macro_driver"] = attribution["macro_driver"]
+        out["macro_driver_component"] = attribution["macro_driver_component"]
+    else:
+        out["macro_driver"] = pd.Series([None] * len(index), index=index, dtype=object)
+        out["macro_driver_component"] = pd.Series(np.nan, index=index, dtype=float)
+
+    return out[list(OHLCV_COLUMNS) + list(FEATURE_COLUMNS) + list(FACTOR_COLUMNS)]
 
 
 def detect_moves(

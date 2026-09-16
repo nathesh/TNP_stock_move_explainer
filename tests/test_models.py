@@ -7,15 +7,20 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
+from sqlalchemy import inspect
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
 from stock_moves.db import Session, session_scope
 from stock_moves.models import (
+    EDGE_RELATIONS,
+    EDGE_SOURCES,
     Article,
     ChatMessage,
     Company,
+    CompanyEdge,
     Explanation,
+    GeoEvent,
     Move,
     MoveArticle,
     Price,
@@ -62,6 +67,8 @@ def _price(move_date: date = MOVE_DATE) -> Price:
         near_earnings=True,
         near_fomc=False,
         near_cpi=True,
+        macro_driver="oil",
+        macro_driver_component=-0.004,
     )
 
 
@@ -85,6 +92,11 @@ def _move() -> Move:
         near_fomc=False,
         near_cpi=True,
         peer_comove=0.012,
+        sub_routing="share_shift",
+        macro_driver="oil",
+        macro_driver_component=-0.004,
+        rival_comove=-0.031,
+        chain_comove=0.002,
     )
 
 
@@ -168,6 +180,8 @@ def test_full_chain_round_trip(session: Session) -> None:
     assert stored_price.near_earnings is True
     assert stored_price.near_fomc is False
     assert stored_price.near_cpi is True
+    assert stored_price.macro_driver == "oil"
+    assert stored_price.macro_driver_component == pytest.approx(-0.004)
 
     stored_move = session.exec(select(Move).where(Move.date == MOVE_DATE)).one()
     assert stored_move.direction == "up"
@@ -175,6 +189,11 @@ def test_full_chain_round_trip(session: Session) -> None:
     assert stored_move.date == stored_price.date
     assert stored_move.peer_comove == pytest.approx(0.012)
     assert stored_move.near_cpi is True
+    assert stored_move.sub_routing == "share_shift"
+    assert stored_move.macro_driver == "oil"
+    assert stored_move.macro_driver_component == pytest.approx(-0.004)
+    assert stored_move.rival_comove == pytest.approx(-0.031)
+    assert stored_move.chain_comove == pytest.approx(0.002)
 
     stored_link = session.exec(
         select(MoveArticle).where(MoveArticle.move_id == stored_move.id)
@@ -239,6 +258,7 @@ def test_move_article_defaults_are_zero(session: Session) -> None:
     assert stored.coverage == 0.0
     assert stored.timing_kind is None
     assert stored.model_score is None
+    assert stored.geo_gate is None
 
 
 def test_explanation_cited_ids_default(session: Session) -> None:
@@ -295,6 +315,198 @@ def test_duplicate_article_url_violates_unique_constraint(session: Session) -> N
     session.rollback()
 
 
+def test_v15_tables_are_created(session: Session) -> None:
+    """`create_all` builds the v1.5 tables alongside the v1 ones."""
+    bind = session.get_bind()
+    names = set(inspect(bind).get_table_names())
+    assert {"company_edges", "geo_events"} <= names
+    assert {
+        "companies",
+        "prices",
+        "moves",
+        "articles",
+        "move_articles",
+        "explanations",
+        "chat_messages",
+    } <= names
+
+
+def test_edge_relation_and_source_vocabularies() -> None:
+    assert EDGE_RELATIONS == ("competitor", "supplier", "customer", "country", "factor")
+    assert EDGE_SOURCES == ("model", "etf_holdings", "prices")
+
+
+def test_company_edge_round_trips(session: Session) -> None:
+    session.add(_company())
+    session.add(
+        CompanyEdge(src="NVDA", dst="AMD", relation="competitor", weight=0.8, source="model")
+    )
+    session.add(CompanyEdge(src="NVDA", dst="TW", relation="country", weight=0.9, source="model"))
+    session.add(
+        CompanyEdge(src="NVDA", dst="oil", relation="factor", weight=-0.12, source="prices")
+    )
+    session.commit()
+
+    stored = session.exec(
+        select(CompanyEdge).where(CompanyEdge.src == "NVDA", CompanyEdge.relation == "competitor")
+    ).one()
+    assert stored.dst == "AMD"
+    assert stored.weight == pytest.approx(0.8)
+    assert stored.source == "model"
+    assert stored.relation in EDGE_RELATIONS
+    assert stored.source in EDGE_SOURCES
+    assert isinstance(stored.updated_at, datetime)
+
+    factor = session.exec(select(CompanyEdge).where(CompanyEdge.relation == "factor")).one()
+    assert (factor.dst, factor.weight) == ("oil", pytest.approx(-0.12))
+
+    assert len(session.exec(select(CompanyEdge).where(CompanyEdge.src == "NVDA")).all()) == 3
+
+
+def test_company_edge_weight_defaults_to_one(session: Session) -> None:
+    session.add(CompanyEdge(src="NVDA", dst="AVGO", relation="competitor", source="etf_holdings"))
+    session.commit()
+
+    assert session.exec(select(CompanyEdge)).one().weight == pytest.approx(1.0)
+
+
+def test_company_edge_key_is_src_dst_relation(session: Session) -> None:
+    """The same pair may carry two relations; the same triple may not repeat."""
+    session.add(CompanyEdge(src="AAPL", dst="TSM", relation="supplier", source="model"))
+    session.add(CompanyEdge(src="AAPL", dst="TSM", relation="customer", source="model"))
+    session.commit()
+    assert len(session.exec(select(CompanyEdge)).all()) == 2
+
+    session.add(CompanyEdge(src="AAPL", dst="TSM", relation="supplier", source="etf_holdings"))
+    with pytest.raises(IntegrityError):
+        session.commit()
+    session.rollback()
+
+
+def test_geo_event_round_trips_with_titles(session: Session) -> None:
+    session.add(
+        GeoEvent(
+            date=MOVE_DATE,
+            country="TW",
+            headline_count=7,
+            sample_titles_json=json.dumps(["Taiwan export controls widen", "Chip curbs tighten"]),
+            news_source="google_rss",
+        )
+    )
+    session.commit()
+
+    stored = session.exec(select(GeoEvent).where(GeoEvent.country == "TW")).one()
+    assert stored.id is not None
+    assert stored.date == MOVE_DATE
+    assert stored.headline_count == 7
+    assert stored.sample_titles == ["Taiwan export controls widen", "Chip curbs tighten"]
+    assert stored.news_source == "google_rss"
+    assert isinstance(stored.fetched_at, datetime)
+
+
+def test_geo_event_titles_default_and_malformed_json() -> None:
+    def event(titles_json: str | None = None) -> GeoEvent:
+        kwargs = {} if titles_json is None else {"sample_titles_json": titles_json}
+        return GeoEvent(
+            date=MOVE_DATE, country="CN", headline_count=0, news_source="gdelt", **kwargs
+        )
+
+    assert event().sample_titles == []
+    assert event("not json").sample_titles == []
+    assert event('{"a": 1}').sample_titles == []
+
+
+def test_duplicate_geo_event_violates_unique_constraint(session: Session) -> None:
+    def event(news_source: str = "google_rss", headline_count: int = 4) -> GeoEvent:
+        return GeoEvent(
+            date=MOVE_DATE,
+            country="CN",
+            headline_count=headline_count,
+            news_source=news_source,
+        )
+
+    session.add(event())
+    session.commit()
+
+    # A second count for the same day, country and source is the duplicate.
+    session.add(event(headline_count=9))
+    with pytest.raises(IntegrityError):
+        session.commit()
+    session.rollback()
+
+    # The other source is a different row, not a duplicate.
+    session.add(event(news_source="gdelt"))
+    session.commit()
+    assert len(session.exec(select(GeoEvent)).all()) == 2
+
+
+def test_move_v15_fields_default_to_none(session: Session) -> None:
+    """A v1-shaped `Move` still constructs; every v1.5 column defaults to None."""
+    move = Move(
+        ticker="AMD",
+        date=MOVE_DATE,
+        ret=-0.06,
+        ret_z=-2.4,
+        routing="industry",
+        direction="down",
+    )
+    session.add(move)
+    session.commit()
+
+    stored = session.exec(select(Move).where(Move.ticker == "AMD")).one()
+    assert stored.sub_routing is None
+    assert stored.macro_driver is None
+    assert stored.macro_driver_component is None
+    assert stored.rival_comove is None
+    assert stored.chain_comove is None
+    assert stored.peer_comove is None
+
+
+def test_price_macro_driver_defaults_to_none(session: Session) -> None:
+    session.add(
+        Price(
+            ticker="AMD",
+            date=MOVE_DATE,
+            open=1.0,
+            high=1.0,
+            low=1.0,
+            close=1.0,
+            volume=1.0,
+        )
+    )
+    session.commit()
+
+    stored = session.exec(select(Price).where(Price.ticker == "AMD")).one()
+    assert stored.macro_driver is None
+    assert stored.macro_driver_component is None
+
+
+def test_move_article_geo_gate_round_trips(session: Session) -> None:
+    move = _move()
+    article = Article(
+        url="https://news.google.com/rss/articles/geo",
+        title="China widens export controls",
+        news_source="google_rss",
+    )
+    session.add_all([move, article])
+    session.commit()
+    assert move.id is not None and article.id is not None
+
+    session.add(
+        MoveArticle(
+            move_id=move.id,
+            article_id=article.id,
+            relevance=0.30,
+            category="macro",
+            provider="heuristic",
+            geo_gate=0.0,
+        )
+    )
+    session.commit()
+
+    assert session.exec(select(MoveArticle)).one().geo_gate == pytest.approx(0.0)
+
+
 def test_session_scope_commits_and_rolls_back(session: Session) -> None:
     """`session_scope` uses the engine the fixture configured, so it sees the same rows."""
     with session_scope() as scoped:
@@ -318,7 +530,7 @@ def test_settings_defaults(no_api_key: None, monkeypatch: pytest.MonkeyPatch) ->
     assert settings.anthropic_model == "claude-sonnet-5"
     assert settings.news_source == "google_rss"
     assert settings.db_path == Path("data/app.db")
-    assert settings.default_period == "1y"
+    assert settings.default_period == "2y"
     assert settings.default_top_n == 10
     assert settings.default_z_threshold == pytest.approx(2.0)
     assert settings.default_pct_threshold == pytest.approx(0.02)

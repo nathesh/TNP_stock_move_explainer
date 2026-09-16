@@ -23,6 +23,7 @@ fail a request. The broad excepts are deliberate and each is marked.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from typing import Any, TypeVar
@@ -37,22 +38,31 @@ from stock_moves.providers.base import (
     ChatTurn,
     ExplanationResult,
     MoveContext,
+    Relations,
     ToolCallRecord,
     ToolFn,
 )
 from stock_moves.providers.heuristic import HeuristicProvider
 from stock_moves.providers.prompts import (
     EXPLAIN_SYSTEM,
+    MAX_COUNTRIES,
+    MAX_PEERS,
+    MAX_SUPPLY_CHAIN,
     PEERS_SYSTEM,
+    RELATIONS_SYSTEM,
     SCORE_SYSTEM,
     Explanation,
     Peers,
+    RelationsOut,
     Scores,
     chat_system,
     clamp,
+    clean_tickers,
     explain_prompt,
+    normalise_countries,
     openai_tools,
     peers_prompt,
+    relations_prompt,
     score_prompt,
 )
 
@@ -72,6 +82,12 @@ MAX_TOKENS_LONG = 4096
 MAX_TOOL_ITERATIONS = 6
 """Hard stop on the chat tool loop, so a model that keeps calling tools cannot
 run a request forever."""
+
+logger = logging.getLogger(__name__)
+
+_NO_RELATIONS = Relations(competitors=(), suppliers=(), customers=(), countries=())
+"""What a failed `suggest_relations` returns: the same value the keyless
+provider returns, so a lost call degrades to "no edges", never to bad ones."""
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 
@@ -228,6 +244,40 @@ class OpenAIProvider:
             if candidate and candidate != self_ticker
         ]
         return list(dict.fromkeys(cleaned))[:6]
+
+    def suggest_relations(
+        self, ticker: str, name: str, sector: str | None, industry: str | None
+    ) -> Relations:
+        """The company's competitors, suppliers, customers and countries, in
+        one call (v1.5 decision 3).
+
+        Same transport and the same degrade contract as `suggest_peers`: one
+        structured-output call, and any failure at all returns the empty
+        `Relations` rather than raising. Empty is a meaningful answer here --
+        it is exactly what the keyless provider returns -- so an ingest that
+        loses this call stores no edges instead of failing.
+        """
+        try:
+            parsed = self._parse(
+                RELATIONS_SYSTEM,
+                relations_prompt(ticker, name, sector, industry),
+                RelationsOut,
+                MAX_TOKENS_SHORT,
+            )
+        except Exception as exc:  # noqa: BLE001 - edges are optional; never fail ingest
+            logger.warning("%s: suggest_relations failed for %s: %s", self.name, ticker, exc)
+            return _NO_RELATIONS
+
+        try:
+            return Relations(
+                competitors=clean_tickers(parsed.competitors, ticker, MAX_PEERS),
+                suppliers=clean_tickers(parsed.suppliers, ticker, MAX_SUPPLY_CHAIN),
+                customers=clean_tickers(parsed.customers, ticker, MAX_SUPPLY_CHAIN),
+                countries=normalise_countries(parsed.countries, MAX_COUNTRIES),
+            )
+        except Exception as exc:  # noqa: BLE001 - a malformed field is a failed call
+            logger.warning("%s: unusable relations for %s: %s", self.name, ticker, exc)
+            return _NO_RELATIONS
 
     # ------------------------------------------------------------------ #
     # Chat

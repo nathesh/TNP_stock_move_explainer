@@ -23,6 +23,7 @@ from stock_moves.providers.base import (
     ChatTurn,
     ExplanationResult,
     MoveContext,
+    Relations,
     ToolCallRecord,
     ToolFn,
 )
@@ -430,6 +431,25 @@ class HeuristicProvider:
         """No keyless way to name peers from a company alone; the caller falls
         back to the sector ETF's top holdings."""
         return []
+
+    def suggest_relations(
+        self, ticker: str, name: str, sector: str | None, industry: str | None
+    ) -> Relations:
+        """Nothing, in all four relations (v1.5 decision 3).
+
+        The keyless ETF fallback for `competitor` edges is applied by the
+        ontology layer, from the sector ETF's top holdings, exactly as it
+        already is for peers -- not here, because this provider is handed a
+        company's identity and no prices. Suppliers, customers and countries
+        have no keyless source at all: no free feed states them, and inventing
+        them from a sector name would put guesses in a table the gate rule
+        then treats as fact.
+
+        So without a key there are no `country` edges, and the geopolitical
+        gate can never open. That is the honest behaviour, and the write-up
+        says so rather than hiding it behind a plausible default.
+        """
+        return Relations(competitors=(), suppliers=(), customers=(), countries=())
 
     # ------------------------------------------------------------------ #
     # Chat

@@ -10,12 +10,16 @@ import pytest
 
 from stock_moves import prices
 from stock_moves.prices import (
+    COUNTRY_ETFS,
+    FACTOR_ETFS,
     MARKET_ETF,
     SECTOR_ETF,
     PriceFetchError,
     TickerInfo,
+    factor_column_for,
     fetch_earnings_dates,
     fetch_etf_holdings,
+    fetch_factor_returns,
     fetch_info,
     fetch_ohlcv,
     fetch_peer_returns,
@@ -359,6 +363,130 @@ def test_fetch_etf_holdings(monkeypatch: pytest.MonkeyPatch) -> None:
     assert fetch_etf_holdings("EMPTY") == []
     assert fetch_etf_holdings("NOFUNDS") == []
     assert fetch_etf_holdings("UNKNOWN") == []
+
+
+# --------------------------------------------------------------------------
+# Factor proxies (v1.5 plan, decision 4)
+# --------------------------------------------------------------------------
+
+
+def _returns_history(closes: list[float], start: str = "2026-01-02") -> pd.DataFrame:
+    """A minimal normalized OHLCV frame with a known close path."""
+    index = pd.DatetimeIndex(pd.bdate_range(start=start, periods=len(closes)), name="date")
+    return pd.DataFrame(
+        {
+            "open": closes,
+            "high": closes,
+            "low": closes,
+            "close": closes,
+            "volume": [1000.0] * len(closes),
+        },
+        index=index,
+    )
+
+
+def _install_factor_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+    frames: dict[str, pd.DataFrame],
+    seen: list[tuple[str, str]] | None = None,
+) -> None:
+    """Monkeypatch `prices.fetch_ohlcv`; a symbol not in `frames` raises."""
+
+    def fake_fetch(ticker: str, period: str = "2y") -> pd.DataFrame:
+        if seen is not None:
+            seen.append((ticker, period))
+        if ticker not in frames:
+            raise PriceFetchError(f"no price data for {ticker}")
+        return frames[ticker]
+
+    monkeypatch.setattr(prices, "fetch_ohlcv", fake_fetch)
+
+
+def test_factor_and_country_etf_tables() -> None:
+    assert FACTOR_ETFS == {"oil": "USO", "dollar": "UUP", "rates": "TLT", "gold": "GLD"}
+    assert COUNTRY_ETFS == {
+        "TW": "EWT",
+        "CN": "FXI",
+        "JP": "EWJ",
+        "KR": "EWY",
+        "IN": "INDA",
+        "EU": "VGK",
+        "MX": "EWW",
+        "CA": "EWC",
+        "GB": "EWU",
+        "DE": "EWG",
+    }
+
+
+def test_factor_column_for_prefixes_only_countries() -> None:
+    assert factor_column_for("oil") == "oil"
+    assert factor_column_for(" rates ") == "rates"
+    assert factor_column_for("TW") == "country:TW"
+    assert factor_column_for("tw") == "country:TW"
+    assert factor_column_for("country:tw") == "country:TW"
+    # Not a country we hold an ETF for: stored verbatim, never invented.
+    assert factor_column_for("BR") == "BR"
+
+
+def test_fetch_factor_returns_columns_and_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_factor_fetch(
+        monkeypatch,
+        {
+            "USO": _returns_history([100.0, 101.0, 99.99]),
+            "EWT": _returns_history([50.0, 52.0, 52.0]),
+        },
+    )
+
+    returns = fetch_factor_returns({"oil": "USO", "TW": "EWT"})
+
+    assert list(returns.columns) == ["oil", "country:TW"]
+    assert returns.index.name == "date"
+    assert returns.index.is_monotonic_increasing
+    assert pd.isna(returns["oil"].iloc[0])  # no prior close
+    assert returns["oil"].iloc[1] == pytest.approx(0.01)
+    assert returns["country:TW"].iloc[1] == pytest.approx(0.04)
+    assert returns["country:TW"].iloc[2] == pytest.approx(0.0)
+
+
+def test_fetch_factor_returns_drops_a_failed_symbol_with_a_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _install_factor_fetch(monkeypatch, {"USO": _returns_history([100.0, 101.0])})
+
+    with caplog.at_level("WARNING", logger="stock_moves.prices"):
+        returns = fetch_factor_returns({"oil": "USO", "gold": "GLD", "CN": "FXI"})
+
+    # A missing proxy is one fewer candidate driver, never a failed ingest.
+    assert list(returns.columns) == ["oil"]
+    assert "gold" in caplog.text
+    assert "country:CN" in caplog.text
+
+
+def test_fetch_factor_returns_empty_when_nothing_resolves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_factor_fetch(monkeypatch, {})
+
+    assert fetch_factor_returns({"oil": "USO"}).empty
+    assert fetch_factor_returns({}).empty
+    assert list(fetch_factor_returns({}).columns) == []
+    assert fetch_factor_returns({}).index.name == "date"
+
+
+def test_fetch_factor_returns_skips_blanks_and_forwards_the_period(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[tuple[str, str]] = []
+    _install_factor_fetch(monkeypatch, {"USO": _returns_history([100.0, 101.0])}, seen)
+
+    assert fetch_factor_returns({"oil": " ", "  ": "USO"}).empty
+    assert seen == []
+
+    fetch_factor_returns({"oil": "USO"}, period="6mo")
+    assert seen == [("USO", "6mo")]
+
+    fetch_factor_returns({"oil": "USO"})
+    assert seen[-1] == ("USO", "2y")
 
 
 @pytest.mark.skip(reason="network")
