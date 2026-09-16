@@ -250,7 +250,7 @@ def test_explain_falls_back_to_the_heuristic_when_the_client_raises() -> None:
 
     result = provider(client).explain(ctx(), scored())
 
-    assert "AMD fell 6.1%" in result.summary
+    assert "was down 6.1%" in result.summary
     assert result.primary_category == "company"
     assert result.cited_article_ids == (1, 2)
 
@@ -375,7 +375,7 @@ def test_chat_falls_back_to_the_heuristic_when_the_client_raises() -> None:
     )
 
     # The heuristic answered from the same tools rather than the error escaping.
-    assert "2025-06-03" in reply.reply
+    assert "Tuesday, 3 June 2025" in reply.reply
     assert [record.name for record in reply.tool_calls] == ["get_move"]
     assert calls == [{"name": "get_move", "ticker": "AMD", "date": "2025-06-03"}]
 

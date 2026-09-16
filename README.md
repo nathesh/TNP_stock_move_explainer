@@ -21,12 +21,24 @@ regime, and same-day peer co-movement are part of the same context. Everything
 external sits behind an interface (`NewsSource`, `ModelProvider`), so a paid
 news feed or a different model is a swap, not a rewrite.
 
+**Written for a reader, not for a quant.** A z-score, a factor loading and a
+component in percentage points are all meaningful to someone who already knows
+what they are, and noise to everyone else. `narrate.py` is the single place
+that decides how each quantity is *said* -- a z-score becomes "about four times
+the size of a typical day", the decomposition becomes "8.6 of the 14.5 points
+came from Tesla itself" -- and it feeds both the keyless renderer and the
+keyed providers' prompts, so an explanation reads the same however it was
+produced. An answer about several moves leads with what they have in common
+before listing them, because a reader who wanted rows would have read the
+table.
+
 **Zero keys required.** With no API key the keyless `HeuristicProvider` scores
-headlines by entity hits and templates the explanation from the decomposition;
-news comes from keyless Google News RSS. An `ANTHROPIC_API_KEY` upgrades the
-scoring and the prose (and the chat endpoint to a real tool-calling loop); if
-a model call fails the app degrades to the heuristic instead of erroring, and
-the stored explanation is labelled with the provider that actually wrote it.
+headlines by entity hits and narrates the explanation from the decomposition;
+news comes from keyless Google News RSS. An `OPENAI_API_KEY` (or an
+`ANTHROPIC_API_KEY`) upgrades the scoring and the prose (and the chat endpoint
+to a real tool-calling loop); if a model call fails the app degrades to the
+heuristic instead of erroring, and the stored explanation is labelled with the
+provider that actually wrote it.
 
 ## Setup
 
@@ -38,11 +50,19 @@ No keys are needed. Optional settings go in a `.env` file in the repo root:
 
 ```dotenv
 # .env  (all optional)
+OPENAI_API_KEY=sk-proj-your-key-here
+OPENAI_MODEL=gpt-4.1            # the workhorse tier; any chat model works
 ANTHROPIC_API_KEY=sk-ant-your-key-here
 ANTHROPIC_MODEL=claude-sonnet-5
 NEWS_SOURCE=google_rss          # or: gdelt
 DB_PATH=data/app.db
 ```
+
+Both vendors are implemented against the same `ModelProvider` protocol and
+share their prompts, so the choice is one environment variable. OpenAI wins
+when both keys are set. `gpt-4.1` is the default because this app makes
+roughly one call per move: a reasoning model's latency is paid ten times over
+on a single ingest, and the task is writing, not reasoning.
 
 ## Run
 
@@ -76,9 +96,11 @@ vercel deploy          # preview
 vercel deploy --prod   # production
 ```
 
-An `ANTHROPIC_API_KEY` set in the Vercel project's environment variables
+An `OPENAI_API_KEY` set in the Vercel project's environment variables
 upgrades scoring, prose and chat exactly as it does locally; the committed
-snapshot keeps whichever provider wrote each stored explanation.
+snapshot keeps whichever provider wrote each stored explanation. With no key
+set the deployment still works -- it answers from the heuristic, in the same
+plain English.
 
 Two properties of the deployment worth stating plainly, because they are
 limits and not surprises: `/tmp` is not shared between instances, so an ingest
@@ -98,7 +120,7 @@ curl -s -X POST 'http://127.0.0.1:8000/tickers/AAPL/ingest?period=1y&top_n=5' | 
 {
   "ticker": "AAPL", "period": "1y", "top_n": 5,
   "n_prices": 251, "n_moves": 43, "n_articles": 150, "n_explanations": 5,
-  "provider": "anthropic", "news_source": "google_rss"
+  "provider": "openai", "news_source": "google_rss"
 }
 ```
 
@@ -123,7 +145,7 @@ curl -s 'http://127.0.0.1:8000/tickers/AAPL?direction=down&limit=5' | python -m 
       "mkt_component": 0.010, "sector_component": 0.001, "idio_component": -0.084,
       "peer_comove": -0.000527,
       "explanation": {
-        "summary": "AAPL fell 7.4% on 2026-07-31, a 4.0-sigma day ... The day was inside an earnings window. Related headlines: Apple stock falls on weak revenue forecast as CEO Tim Cook flags 'increasing impact' from memory shortage (Yahoo Finance); ...",
+        "summary": "Apple was down 7.4% on Friday, 31 July 2026. That is roughly four times the size of a typical day for AAPL. Most of it was Apple itself, worth 8.4 points on its own -- more than the 7.4-point move, with 1.0 from the wider market and 0.1 from the rest of the sector both pushing the other way. The move landed within a day of the company's own earnings.",
         "primary_category": "company", "confidence": 0.9,
         "cited_article_ids": [31, 33, 36], "unexplained": false
       },
@@ -180,12 +202,14 @@ threshold (`POST .../ingest?z_threshold=1.5`) to make more days into moves.
 uv run pytest -q
 ```
 
-246 tests, and **none of them touch the network**: prices, news and the model
-provider are all faked. They cover move detection and the decomposition on
-synthetic price frames, the RSS and GDELT parsers on canned payloads, the
-keyless scorer and explainer, the Anthropic provider's schema handling and its
+306 tests, and **none of them touch the network**: prices, news and both
+model providers are all faked. They cover move detection and the decomposition
+on synthetic price frames, the RSS and GDELT parsers on canned payloads, the
+keyless scorer and explainer, the phrasing rules in `narrate` (including that
+no jargon reaches the reader and that each sentence stays true of the numbers
+it came from), each keyed provider's schema handling and its
 degrade-to-heuristic behaviour, idempotent ingest, the query layer's filters,
-every API route through FastAPI's `TestClient`, and the chat tool loop. One
+every API route through FastAPI's `TestClient`, and both chat tool loops. One
 test is marked `network` and is skipped by default; it is the only live check.
 
 ## Design

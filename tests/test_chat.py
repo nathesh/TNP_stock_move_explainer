@@ -136,14 +136,20 @@ def test_dated_question_calls_get_move_and_returns_the_explanation(
     assert response.status_code == 200
 
     body = response.json()
-    assert SUMMARY in body["reply"]
+    # The stored summary was written by the heuristic, so the reply is the
+    # regenerated prose rather than a replay of it.
+    assert "down 5.0%" in body["reply"]
     assert body["session_id"]
     assert body["tool_calls"][0]["name"] == "get_move"
-    # The tool output is the same dict the ticker route serves, articles included.
+    # The tool output is the same dict the ticker route serves, articles
+    # included, plus the two fields a reader needs: the company's short name
+    # and the decomposition already said in English.
     output = body["tool_calls"][0]["output"]
     assert output["date"] == MOVE_DATE.isoformat()
     assert output["explanation"]["summary"] == SUMMARY
     assert [a["title"] for a in output["articles"]] == ["Testco cuts full-year guidance"]
+    assert output["company"] == "Testco Industries"
+    assert "typical day" in output["narrative"]
 
 
 def test_second_turn_reuses_the_session_and_persists_both_turns(

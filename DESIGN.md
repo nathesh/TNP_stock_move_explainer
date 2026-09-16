@@ -79,11 +79,15 @@ Articles are deduped on URL, stored once, and linked to moves through
 
 ## 4. Scoring and explanation (the model layer)
 
-`ModelProvider` interface with two implementations:
+`ModelProvider` interface with three implementations:
 
-- `AnthropicProvider` (used when `ANTHROPIC_API_KEY` is set): scores each
-  article (relevance 0–1, category company/industry/macro) and writes the
-  per-move explanation.
+- `OpenAIProvider` (used when `OPENAI_API_KEY` is set) and `AnthropicProvider`
+  (when `ANTHROPIC_API_KEY` is): each scores an article (relevance 0–1,
+  category company/industry/macro) and writes the per-move explanation. They
+  share their prompts, their structured-output schemas and their prompt
+  rendering in `providers/prompts.py`; what differs is transport, so the two
+  answer alike and neither can drift when a prompt is edited. OpenAI is
+  preferred when both keys are set.
 - `HeuristicProvider` (no key): keyword rules + the decomposition. Relevance =
   name/peer/macro-term hits; category = routing bucket; explanation = a
   templated sentence from the numbers. **The app runs with zero keys.**
@@ -103,6 +107,19 @@ co-movement, the top-K scored articles. Output is structured:
 {"summary": "...", "primary_category": "company|industry|macro|unexplained",
  "confidence": 0.0-1.0, "cited_article_ids": [...], "unexplained": false}
 ```
+
+**Saying it in English (`narrate.py`).** The decomposition is the answer to
+"why", but a z-score and a component in percentage points are not an answer a
+reader can use. One dependency-free module owns the phrasing: `|z|` becomes a
+multiple of an ordinary day, the components become points of the move itself,
+`near_fomc` becomes "a Federal Reserve rate decision". It is used twice — the
+keyless provider renders it directly, and the keyed providers are handed the
+same sentences inside the prompt, so the model weighs headlines instead of
+converting factor loadings. A set of moves also gets one sentence about the
+set, stated only when a claim holds for a clear majority; that synthesis is
+the part a list of rows cannot do for the reader. The same ban on jargon is
+asserted in the tests for the keyless half and written into
+`prompts.PLAIN_ENGLISH` for the keyed half.
 
 Cached per move in `explanations`. Explanations are computed for the top-N
 moves by `abs(ret_z)` on ingest (default N=10) and on demand for any other move

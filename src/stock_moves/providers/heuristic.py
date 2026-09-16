@@ -13,6 +13,7 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from stock_moves import narrate
 from stock_moves.providers.base import (
     MACRO_TERMS,
     ArticleInput,
@@ -203,31 +204,6 @@ def _fmt_pct(value: Any, digits: int = 1) -> str:
     return f"{value:+.{digits}%}" if isinstance(value, (int, float)) else ""
 
 
-def _article_line(article: Mapping[str, Any]) -> str:
-    bits = [
-        str(article.get("published_at") or "")[:10],
-        str(article.get("title") or ""),
-    ]
-    source = article.get("source")
-    if source:
-        bits.append(f"({source})")
-    return " ".join(b for b in bits if b)
-
-
-def _move_line(move: Mapping[str, Any]) -> str:
-    explanation = move.get("explanation") or {}
-    summary = explanation.get("summary") if isinstance(explanation, Mapping) else None
-    z = move.get("ret_z")
-    cells = [
-        str(move.get("date") or ""),
-        _fmt_pct(move.get("ret")),
-        f"z={z:+.1f}" if isinstance(z, (int, float)) else "",
-        str(move.get("routing") or ""),
-        str(summary or ""),
-    ]
-    return "  ".join(cells).rstrip()
-
-
 class HeuristicProvider:
     """Keyword rules plus the decomposition. No external calls."""
 
@@ -276,16 +252,21 @@ class HeuristicProvider:
     def explain(
         self, move: MoveContext, scored: Sequence[tuple[ArticleInput, ArticleScore]]
     ) -> ExplanationResult:
-        """Template the numbers. Returns `unexplained` when nothing in the
-        window matched and the move is not extreme enough to assert a cause
-        on the decomposition alone."""
+        """Say the numbers in English, via `narrate`. Returns `unexplained`
+        when nothing in the window matched and the move is not extreme
+        enough to assert a cause on the decomposition alone.
+
+        The phrasing is `narrate`'s so that a keyless install, a degraded
+        model call and a keyed explanation all describe a move the same way.
+        """
         relevant = [(a, s) for a, s in scored if s.relevance >= 0.5]
 
         if not relevant and abs(move.ret_z) < 3:
             summary = (
-                f"{move.ticker} moved {move.ret:+.1%} on {move.date} "
-                f"(z={move.ret_z:+.1f}); no headline in the ±1 day window "
-                f"matched the company, its peers or macro terms."
+                f"{move.ticker} was {narrate.plain_move(move.ret)} on "
+                f"{narrate.plain_day(move.date)}, but no headline in the day "
+                f"either side mentioned the company, its competitors or the "
+                f"wider economy, so there is nothing here to attribute it to."
             )
             return ExplanationResult(
                 summary=summary,
@@ -295,47 +276,22 @@ class HeuristicProvider:
                 unexplained=True,
             )
 
-        opener = (
-            f"{move.ticker} {'fell' if move.ret < 0 else 'rose'} "
-            f"{abs(move.ret):.1%} on {move.date}, a {abs(move.ret_z):.1f}-sigma "
-            f"day for the stock."
-        )
-        sentences: list[str] = [opener]
-
-        components = dict(
-            zip(
-                _COMPONENT_LABELS,
-                (move.mkt_component, move.sector_component, move.idio_component),
-                strict=True,
-            )
-        )
-        present = {k: v for k, v in components.items() if v is not None}
-        if present:
-            dominant = max(present, key=lambda k: abs(present[k]))
-            total = sum(abs(v) for v in present.values())
-            share = abs(present[dominant]) / total if total > 0 else 0.0
-            detail = ", ".join(f"{k} {v * 100:+.1f}pp" for k, v in present.items())
-            sentences.append(f"The {dominant} component dominated ({detail}).")
-        else:
-            share = 0.0
-            sentences.append("No factor decomposition was available for the day.")
-
-        if move.near_earnings:
-            sentences.append("The day was inside an earnings window.")
-        if move.near_fomc:
-            sentences.append("The day was within a day of an FOMC decision.")
-        if move.near_cpi:
-            sentences.append("The day was within a day of a CPI release.")
-        if move.peer_comove is not None:
-            sentences.append(f"Peers moved {move.peer_comove:+.1%} on average the same day.")
-
+        facts = narrate.MoveFacts.from_context(move)
         cited = relevant[:3]
+        # One headline, named as coverage rather than as a cause. The full set
+        # is already on the move's `articles`; three of them pasted into a
+        # sentence is what made the stored summaries unreadable.
+        headlines = []
         if cited:
-            titles = "; ".join(
-                article.title + (f" ({article.source})" if article.source else "")
-                for article, _ in cited
-            )
-            sentences.append(f"Related headlines: {titles}")
+            article = cited[0][0]
+            source = f" ({article.source})" if article.source else ""
+            headlines.append(f"the day's coverage led with \u201c{article.title}\u201d{source}")
+        sentences = narrate.summary_sentences(facts, headlines)
+
+        components = (move.mkt_component, move.sector_component, move.idio_component)
+        present = [value for value in components if value is not None]
+        total = sum(abs(value) for value in present)
+        share = (max(abs(value) for value in present) / total) if present and total > 0 else 0.0
 
         confidence = min(
             0.9,
@@ -425,30 +381,62 @@ class HeuristicProvider:
         )
 
     def _render(self, name: str, ticker: str, payload: dict[str, Any], output: Any) -> str:
+        """The tool's result as prose.
+
+        This is the keyless answer to "synthesise before sending it out": the
+        rows are grouped, the numbers are said in English and the set gets a
+        sentence of its own. `narrate` does the writing so that the keyed
+        providers, which are handed the same sentences in their prompt, cannot
+        drift from it.
+        """
+        company = _company_of(output)
         if name == "get_move":
             if not isinstance(output, Mapping) or not output:
                 return f"No move stored for {ticker} on {payload.get('date')}."
             error = output.get("error")
             if error:
                 return str(error)
-            explanation = output.get("explanation")
-            summary = (
-                explanation.get("summary") if isinstance(explanation, Mapping) else None
-            ) or "No explanation yet"
-            lines = [f"{ticker} on {output.get('date', payload.get('date'))}", summary]
-            lines += [
-                f"- {_article_line(a)}" for a in _as_list(output.get("articles"), "articles")[:3]
-            ]
-            return "\n".join(lines)
+            return narrate.narrate_one_move(
+                ticker, output, company, model_summary=_stored_summary(output)
+            )
 
         if name == "list_moves":
             moves = _as_list(output, "moves")
             if not moves:
                 return f"No stored moves for {ticker}."
-            header = f"Largest moves for {ticker}:"
-            return "\n".join([header, *(_move_line(m) for m in moves)])
+            return narrate.narrate_moves(ticker, moves, company, direction=payload.get("direction"))
 
-        articles = _as_list(output, "articles")
-        if not articles:
-            return f"No stored headlines for {ticker}."
-        return "\n".join([f"Headlines for {ticker}:", *(f"- {_article_line(a)}" for a in articles)])
+        return narrate.narrate_news(ticker, _as_list(output, "articles"))
+
+
+def _company_of(output: Any) -> str:
+    """The company name the chat tools attach to every move, if present."""
+    rows = output if isinstance(output, list) else [output]
+    for row in rows:
+        if isinstance(row, Mapping) and row.get("company"):
+            return str(row["company"])
+    return ""
+
+
+def _stored_summary(move: Mapping[str, Any]) -> str | None:
+    """The stored summary, when replaying it beats regenerating it.
+
+    Two cases qualify. A model wrote it, so it says more than the numbers can.
+    Or it is marked `unexplained`, where the finding *is* that no headline
+    matched -- a fact the decomposition alone cannot state, and one a reader
+    would otherwise have to infer from an absent list of headlines.
+
+    Otherwise the heuristic's own summaries are regenerated from the move's
+    numbers rather than replayed, so rows written by an older version of this
+    file still read the way the current one speaks.
+    """
+    explanation = move.get("explanation")
+    if not isinstance(explanation, Mapping):
+        return None
+    summary = explanation.get("summary")
+    if not summary:
+        return None
+    if explanation.get("unexplained"):
+        return str(summary)
+    provider = str(explanation.get("provider") or "")
+    return None if provider in {"", "heuristic"} else str(summary)

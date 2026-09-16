@@ -20,6 +20,18 @@ from stock_moves.providers.heuristic import HeuristicProvider
 
 PROVIDER = HeuristicProvider()
 
+#: Terms that are meaningful inside the decomposition and meaningless to the
+#: reader of an explanation. Every one of these used to reach the user
+#: verbatim; the readability contract in `prompts.PLAIN_ENGLISH` bans the same
+#: list from the keyed providers, so this is the keyless half of one rule.
+JARGON = ("sigma", "z=", "z-score", "idiosyncratic", "pp)", "pp,", "pp.", "beta")
+
+
+def assert_no_jargon(text: str) -> None:
+    lowered = text.lower()
+    leaked = [term for term in JARGON if term in lowered]
+    assert not leaked, f"jargon reached the reader: {leaked}\n{text}"
+
 
 def ctx(**overrides: Any) -> MoveContext:
     """A move context with sane defaults; override only what a test needs."""
@@ -162,7 +174,7 @@ def test_explain_returns_unexplained_when_nothing_matched() -> None:
     assert result.confidence == 0.2
     assert result.cited_article_ids == ()
     assert "no headline" in result.summary
-    assert "-5.0%" in result.summary
+    assert "down 5.0%" in result.summary
 
 
 def test_an_extreme_move_is_explained_even_with_no_headlines() -> None:
@@ -183,14 +195,18 @@ def test_explain_routes_cites_at_most_three_and_caps_confidence() -> None:
     assert result.primary_category == "company"
     assert result.cited_article_ids == (1, 2, 3)
     assert result.confidence == 0.9
-    assert "fell 5.0%" in result.summary
-    assert "2.5-sigma" in result.summary
-    assert "idiosyncratic component dominated" in result.summary
-    assert "-4.7pp" in result.summary
-    assert "The day was inside an earnings window." in result.summary
-    assert "Related headlines: " in result.summary
+    assert "was down 5.0%" in result.summary
+    # The size as a multiple of an ordinary day, and the decomposition as a
+    # share of the move -- not a z-score and not percentage points.
+    assert "twice the size of a typical day" in result.summary
+    assert "4.7 of the 5.0 points" in result.summary
+    assert "within a day of the company's own earnings" in result.summary
+    # One headline, named as coverage. Three pasted into a sentence is what
+    # made the old summaries unreadable.
+    assert "the day's coverage led with" in result.summary
     assert "(Reuters)" in result.summary
-    assert "headline 4" not in result.summary
+    assert "headline 2" not in result.summary
+    assert_no_jargon(result.summary)
 
 
 def test_explain_mentions_macro_windows_and_peer_comovement() -> None:
@@ -200,9 +216,10 @@ def test_explain_mentions_macro_windows_and_peer_comovement() -> None:
         scored,
     )
     assert result.primary_category == "macro"
-    assert "FOMC decision" in result.summary
-    assert "CPI release" in result.summary
-    assert "Peers moved -3.1%" in result.summary
+    assert "Federal Reserve rate decision" in result.summary
+    assert "inflation release" in result.summary
+    assert "Comparable companies were down 3.1%" in result.summary
+    assert_no_jargon(result.summary)
 
 
 def test_explain_without_a_decomposition() -> None:
@@ -210,7 +227,7 @@ def test_explain_without_a_decomposition() -> None:
     result = PROVIDER.explain(
         ctx(mkt_component=None, sector_component=None, idio_component=None), scored
     )
-    assert "No factor decomposition" in result.summary
+    assert "no market-versus-company breakdown" in result.summary
     # 0.3 + 0.15*1, no earnings bonus, no dominance bonus.
     assert result.confidence == 0.45
 
@@ -249,13 +266,16 @@ def test_suggest_peers_is_empty_without_a_key() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _chat_tools() -> tuple[dict[str, ToolFn], dict[str, list[dict[str, Any]]]]:
+def _chat_tools(
+    provider: str = "heuristic",
+    summary: str = "Testco fell on a guidance cut.",
+) -> tuple[dict[str, ToolFn], dict[str, list[dict[str, Any]]]]:
     move_payload = {
         "date": "2025-06-03",
         "ret": -0.05,
         "ret_z": -2.5,
         "routing": "company",
-        "explanation": {"summary": "Testco fell on a guidance cut."},
+        "explanation": {"summary": summary, "provider": provider},
         "articles": [
             {
                 "id": i,
@@ -290,8 +310,20 @@ def test_chat_with_a_date_calls_get_move_once() -> None:
     assert calls["get_move"] == [{"ticker": "TEST", "date": "2025-06-03"}]
     assert calls["list_moves"] == [] and calls["search_news"] == []
     assert [tc.name for tc in reply.tool_calls] == ["get_move"]
-    assert "Testco fell on a guidance cut." in reply.reply
+    # The stored summary was written by the heuristic, so it is regenerated
+    # from the move's own numbers rather than replayed -- rows written before
+    # `narrate` existed still read the way the current code speaks.
+    assert "Tuesday, 3 June 2025 -- down 5.0%" in reply.reply
     assert reply.reply.count("Headline") == 3  # capped at three
+    assert_no_jargon(reply.reply)
+
+
+def test_chat_replays_a_summary_a_model_wrote() -> None:
+    """A keyed provider read the headlines, so its prose says more than the
+    decomposition can. Only the heuristic's own summaries are regenerated."""
+    tools, _ = _chat_tools(provider="openai", summary="Guidance cut sank the stock.")
+    reply = PROVIDER.chat([ChatTurn("user", "what happened to TEST on 2025-06-03")], tools, None)
+    assert "Guidance cut sank the stock." in reply.reply
 
 
 def test_chat_surfaces_the_get_move_error_instead_of_a_blank_explanation() -> None:
@@ -317,7 +349,11 @@ def test_chat_asking_why_it_dropped_lists_down_moves() -> None:
     reply = PROVIDER.chat([ChatTurn("user", "why did TEST drop")], tools, None)
     assert calls["list_moves"] == [{"ticker": "TEST", "direction": "down", "limit": 5}]
     assert calls["get_move"] == [] and calls["search_news"] == []
-    assert "2025-06-03" in reply.reply and "z=-2.5" in reply.reply
+    # The synthesis: what the set is, then each move as a dated block. No
+    # z-score reaches the reader.
+    assert "the biggest fall in the data" in reply.reply
+    assert "Tuesday, 3 June 2025 -- down 5.0%" in reply.reply
+    assert_no_jargon(reply.reply)
 
 
 def test_chat_up_words_flip_the_direction() -> None:

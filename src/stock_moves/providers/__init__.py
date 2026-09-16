@@ -1,12 +1,18 @@
-"""The model layer: one interface, two implementations, one selector.
+"""The model layer: one interface, three implementations, one selector.
 
-`get_provider()` is the only thing the rest of the app calls. It returns the
-Anthropic provider when a key is configured and the heuristic provider
-otherwise, so the app runs with zero keys (DESIGN section 4).
+`get_provider()` is the only thing the rest of the app calls. It returns a
+keyed provider when a key is configured -- OpenAI first, then Anthropic --
+and the heuristic provider otherwise, so the app runs with zero keys
+(DESIGN section 4).
+
+OpenAI is preferred when both keys are set, because that is the deployment
+this app is configured for; setting only `ANTHROPIC_API_KEY` still selects
+Anthropic, and the swap costs one environment variable.
 """
 
 from __future__ import annotations
 
+from importlib import import_module
 from typing import Any
 
 from stock_moves.providers.base import (
@@ -56,17 +62,26 @@ def get_provider(settings: Any | None = None) -> ModelProvider:
         else:
             settings = get_settings()
 
-    api_key = getattr(settings, "anthropic_api_key", None)
-    if api_key:
-        try:
-            from stock_moves.providers.anthropic import AnthropicProvider
-        except ImportError:  # SDK or module missing: fall back, never crash
-            pass
-        else:
-            kwargs: dict[str, Any] = {"api_key": api_key}
-            model = getattr(settings, "anthropic_model", None)
-            if model:
-                kwargs["model"] = model
-            return AnthropicProvider(**kwargs)
+    provider = _keyed_provider(settings, "openai") or _keyed_provider(settings, "anthropic")
+    return provider if provider is not None else HeuristicProvider()
 
-    return HeuristicProvider()
+
+def _keyed_provider(settings: Any, vendor: str) -> ModelProvider | None:
+    """Build `vendor`'s provider, or None when it has no key or no SDK.
+
+    The import is lazy and its failure is not: a missing SDK is the same
+    situation as a missing key, and both mean "try the next one".
+    """
+    api_key = getattr(settings, f"{vendor}_api_key", None)
+    if not api_key:
+        return None
+    try:
+        module = import_module(f"stock_moves.providers.{vendor}")
+    except ImportError:  # SDK or module missing: fall back, never crash
+        return None
+    cls = getattr(module, "OpenAIProvider" if vendor == "openai" else "AnthropicProvider")
+    kwargs: dict[str, Any] = {"api_key": api_key}
+    model = getattr(settings, f"{vendor}_model", None)
+    if model:
+        kwargs["model"] = model
+    return cls(**kwargs)

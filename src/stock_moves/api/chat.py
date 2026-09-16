@@ -29,6 +29,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends
 
+from stock_moves import narrate
 from stock_moves.api.deps import get_db, get_provider_dep
 from stock_moves.api.schemas import ChatRequest, ChatResponse, ToolCallOut
 from stock_moves.db import Session
@@ -38,6 +39,7 @@ from stock_moves.queries import (
     article_to_dict,
     articles_for_move,
     chat_history,
+    get_company,
     get_explanation,
     get_move,
     list_moves,
@@ -61,6 +63,10 @@ _CHAT_ROLES = frozenset({"user", "assistant"})
 #: Tool defaults, matching the `default` values advertised in `TOOL_SPECS`.
 _MOVES_LIMIT = 10
 _ARTICLES_LIMIT = 10
+
+#: Headlines attached to each move in a *list*. Three is what fits in a
+#: readable block; the full set is one `get_move` away.
+_LIST_ARTICLES = 3
 _NEWS_LIMIT = 20
 
 
@@ -164,10 +170,20 @@ def make_tools(session: Session, default_ticker: str | None) -> dict[str, ToolFn
             direction=_as_direction(kwargs.get("direction")),
             limit=_as_limit(kwargs.get("limit"), _MOVES_LIMIT),
         )
+        company = get_company(session, ticker)
         return [
-            move_to_dict(
-                move,
-                None if move.id is None else get_explanation(session, move.id),
+            _enriched(
+                move_to_dict(
+                    move,
+                    None if move.id is None else get_explanation(session, move.id),
+                    (
+                        []
+                        if move.id is None
+                        else articles_for_move(session, move.id, limit=_LIST_ARTICLES)
+                    ),
+                ),
+                ticker,
+                company,
             )
             for move in list_moves(session, ticker, filters)
         ]
@@ -184,10 +200,14 @@ def make_tools(session: Session, default_ticker: str | None) -> dict[str, ToolFn
         move = get_move(session, ticker, on)
         if move is None or move.id is None:
             return {"error": f"no move for {ticker} on {on.isoformat()}"}
-        return move_to_dict(
-            move,
-            get_explanation(session, move.id),
-            articles_for_move(session, move.id, limit=_ARTICLES_LIMIT),
+        return _enriched(
+            move_to_dict(
+                move,
+                get_explanation(session, move.id),
+                articles_for_move(session, move.id, limit=_ARTICLES_LIMIT),
+            ),
+            ticker,
+            get_company(session, ticker),
         )
 
     def tool_search_news(**kwargs: Any) -> list[dict[str, Any]]:
@@ -208,6 +228,23 @@ def make_tools(session: Session, default_ticker: str | None) -> dict[str, ToolFn
         "get_move": tool_get_move,
         "search_news": tool_search_news,
     }
+
+
+def _enriched(move: dict[str, Any], ticker: str, company: Any | None) -> dict[str, Any]:
+    """Add the two things a *reader* of this move needs and the columns lack.
+
+    `company` so an answer can say "Tesla" rather than "TSLA", and `narrative`
+    -- the decomposition already turned into English by `narrate`. A model
+    handed the narration is synthesising across moves and weighing headlines
+    rather than converting factor loadings into prose itself, which is the step
+    that used to leak "idiosyncratic -8.6pp" through to the reader.
+    """
+    name = "" if company is None else str(getattr(company, "name", "") or "")
+    move["company"] = narrate.short_company_name(name or ticker, ticker)
+    move["narrative"] = " ".join(
+        narrate.summary_sentences(narrate.MoveFacts.from_mapping(move, ticker, name))
+    )
+    return move
 
 
 # --------------------------------------------------------------------------- #

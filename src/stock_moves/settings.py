@@ -27,6 +27,8 @@ load_dotenv(REPO_ROOT / ".env")
 class Settings(BaseModel):
     """Runtime configuration; every field is overridable by its upper-cased name."""
 
+    openai_api_key: str | None = None
+    openai_model: str = "gpt-4.1"
     anthropic_api_key: str | None = None
     anthropic_model: str = "claude-sonnet-5"
     news_source: str = "google_rss"

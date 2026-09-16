@@ -1,18 +1,23 @@
-"""The Anthropic keyed provider (DESIGN section 4).
+"""The OpenAI keyed provider (DESIGN section 4).
 
-`claude-sonnet-5` through the official `anthropic` SDK. The prompts, the
-structured-output schemas and the rendering of a move into a prompt are shared
-with the OpenAI provider in `prompts.py`; what is left here is transport.
+`gpt-4.1` through the official `openai` SDK, behind the same `ModelProvider`
+protocol as the Anthropic provider and sharing its prompts and schemas from
+`prompts.py`. The differences from `anthropic.py` are entirely transport:
 
-Three of the four methods are a single structured-output call (`messages.parse` with a Pydantic
-`output_format`), which is what keeps the cost story in DESIGN section 4 true:
-roughly one call per move, not one per headline. `chat` is the only multi-turn
-path -- a manual tool-calling loop over `TOOL_SPECS`.
+- structured output is `chat.completions.parse(response_format=Model)` rather
+  than `messages.parse(output_format=Model)`;
+- the system prompt is the first message rather than a top-level argument;
+- tool calls come back on `message.tool_calls` with JSON-string arguments, and
+  each result goes back as its own `role="tool"` message rather than as blocks
+  inside one user turn.
 
-Every method degrades to `HeuristicProvider` on *any* exception (bad key,
-rate limit, timeout, malformed output). The app is specified to run with zero
-keys, so a broken key must behave like no key at all rather than fail a
-request. The broad excepts are deliberate and each is marked.
+That list is the whole point of the interface: adding a second vendor did not
+touch move detection, scoring policy, storage or the API.
+
+Every method degrades to `HeuristicProvider` on *any* exception (bad key, no
+credit, rate limit, timeout, malformed output). The app is specified to run
+with zero keys, so a broken key must behave like no key at all rather than
+fail a request. The broad excepts are deliberate and each is marked.
 """
 
 from __future__ import annotations
@@ -46,15 +51,17 @@ from stock_moves.providers.prompts import (
     chat_system,
     clamp,
     explain_prompt,
+    openai_tools,
     peers_prompt,
     score_prompt,
 )
 
-__all__ = ["AnthropicProvider"]
+__all__ = ["OpenAIProvider"]
 
-DEFAULT_MODEL = "claude-sonnet-5"
-"""Sonnet is fixed as the default by DESIGN section 4 (never Opus). Settings
-normally pass the model in; this only matters as a fallback."""
+DEFAULT_MODEL = "gpt-4.1"
+"""The workhorse tier, chosen for the prose rather than for reasoning: this
+app makes roughly one call per move, and a reasoning model's latency is paid
+ten times over on a single ingest. Overridable with `OPENAI_MODEL`."""
 
 MAX_TOKENS_SHORT = 2048
 """Scoring and peers: small, fixed-shape JSON."""
@@ -68,15 +75,11 @@ run a request forever."""
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 
-# --------------------------------------------------------------------------- #
-# The provider
-# --------------------------------------------------------------------------- #
 
+class OpenAIProvider:
+    """`gpt-4.1` behind the `ModelProvider` protocol."""
 
-class AnthropicProvider:
-    """`claude-sonnet-5` behind the `ModelProvider` protocol."""
-
-    name: str = "anthropic"
+    name: str = "openai"
 
     def __init__(
         self,
@@ -87,14 +90,14 @@ class AnthropicProvider:
         """Build a provider.
 
         `client` is injected by the tests; in production it defaults to
-        `anthropic.Anthropic(api_key=api_key)`. The SDK import is inside the
+        `openai.OpenAI(api_key=api_key)`. The SDK import is inside the
         constructor so importing this module never requires the SDK.
         """
         self.model = model
         if client is None:
-            import anthropic
+            import openai
 
-            client = anthropic.Anthropic(api_key=api_key)
+            client = openai.OpenAI(api_key=api_key)
         self._client = client
         self._fallback = HeuristicProvider()
 
@@ -106,18 +109,29 @@ class AnthropicProvider:
         self,
         system: str,
         content: str,
-        output_format: type[_ModelT],
+        response_format: type[_ModelT],
         max_tokens: int,
     ) -> _ModelT:
-        """One `messages.parse` call, returning the validated Pydantic model."""
-        response = self._client.messages.parse(
+        """One `chat.completions.parse` call, returning the validated model.
+
+        A refusal (the model declining rather than answering) is raised as an
+        error so it takes the same degrade path as a transport failure: the
+        caller's contract is "an explanation or the heuristic's", never a
+        half-filled object.
+        """
+        response = self._client.chat.completions.parse(
             model=self.model,
-            max_tokens=max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": content}],
-            output_format=output_format,
+            max_completion_tokens=max_tokens,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": content},
+            ],
+            response_format=response_format,
         )
-        parsed = getattr(response, "parsed_output", None)
+        message = response.choices[0].message
+        if getattr(message, "refusal", None):
+            raise ValueError(f"the model refused: {message.refusal}")
+        parsed = getattr(message, "parsed", None)
         if parsed is None:
             raise ValueError("the model returned no parsed output")
         return parsed
@@ -137,7 +151,6 @@ class AnthropicProvider:
         """
         if not articles:
             return []
-
         try:
             parsed = self._parse(
                 SCORE_SYSTEM, score_prompt(move, articles), Scores, MAX_TOKENS_SHORT
@@ -179,7 +192,7 @@ class AnthropicProvider:
                 if int(article_id) in allowed
             )
         )
-        unexplained = bool(parsed.unexplained) or parsed.primary_category == ("unexplained")
+        unexplained = bool(parsed.unexplained) or parsed.primary_category == "unexplained"
         category = "unexplained" if unexplained else str(parsed.primary_category)
         return ExplanationResult(
             summary=parsed.summary.strip(),
@@ -238,32 +251,36 @@ class AnthropicProvider:
         tools: Mapping[str, ToolFn],
         ticker: str | None,
     ) -> ChatReply:
-        system = chat_system(ticker)
-        messages: list[dict[str, Any]] = [
+        messages: list[dict[str, Any]] = [{"role": "system", "content": chat_system(ticker)}]
+        messages += [
             {"role": turn.role, "content": turn.content}
             for turn in history
             if turn.role in {"user", "assistant"} and turn.content
         ]
-        if not messages:
+        if len(messages) == 1:
             return ChatReply("Ask me about a ticker's moves.", [])
 
         records: list[ToolCallRecord] = []
         reply = ""
         for _ in range(MAX_TOOL_ITERATIONS):
-            response = self._client.messages.create(
+            response = self._client.chat.completions.create(
                 model=self.model,
-                max_tokens=MAX_TOKENS_LONG,
-                system=system,
-                tools=TOOL_SPECS,
+                max_completion_tokens=MAX_TOKENS_LONG,
+                tools=openai_tools(TOOL_SPECS),
                 messages=messages,
             )
-            reply = _reply_text(response) or reply
-            if getattr(response, "stop_reason", None) != "tool_use":
+            message = response.choices[0].message
+            reply = (message.content or "").strip() or reply
+
+            calls = list(getattr(message, "tool_calls", None) or [])
+            if not calls:
                 break
-            messages.append({"role": "assistant", "content": response.content})
-            results, new_records = self._run_tools(response, tools, ticker)
+            # The assistant turn carrying the calls has to be echoed back
+            # before their results, or the results reference nothing.
+            messages.append(_assistant_turn(message, calls))
+            results, new_records = self._run_tools(calls, tools, ticker)
             records.extend(new_records)
-            messages.append({"role": "user", "content": results})
+            messages.extend(results)
 
         if not reply:
             reply = "I could not reach an answer within the tool-call budget."
@@ -271,57 +288,72 @@ class AnthropicProvider:
 
     def _run_tools(
         self,
-        response: Any,
+        calls: Sequence[Any],
         tools: Mapping[str, ToolFn],
         ticker: str | None,
     ) -> tuple[list[dict[str, Any]], list[ToolCallRecord]]:
-        """Run every `tool_use` block in one assistant turn.
+        """Run every tool call in one assistant turn.
 
-        All results go back in a single user message, which is what the API
-        expects for parallel tool use. A tool that raises comes back as an
-        error result so the model can recover instead of the request dying.
+        Unlike the Anthropic path, each result is its own `role="tool"`
+        message. A tool that raises comes back as an error string in that same
+        shape so the model can recover instead of the request dying.
         """
         results: list[dict[str, Any]] = []
         records: list[ToolCallRecord] = []
-        for block in response.content:
-            if getattr(block, "type", None) != "tool_use":
-                continue
-            payload: dict[str, Any] = dict(block.input or {})
+        for call in calls:
+            name = call.function.name
+            payload = _tool_arguments(call)
             if not payload.get("ticker") and ticker:
                 payload["ticker"] = ticker
 
-            tool = tools.get(block.name)
+            tool = tools.get(name)
             if tool is None:
-                results.append(_tool_result(block.id, f"unknown tool {block.name}", True))
-                records.append(ToolCallRecord(block.name, payload, None))
+                results.append(_tool_message(call.id, f"unknown tool {name}"))
+                records.append(ToolCallRecord(name, payload, None))
                 continue
             try:
                 output = tool(**payload)
             except Exception as exc:  # noqa: BLE001 - reported to the model, not raised
-                results.append(_tool_result(block.id, f"{type(exc).__name__}: {exc}", True))
-                records.append(ToolCallRecord(block.name, payload, None))
+                results.append(_tool_message(call.id, f"{type(exc).__name__}: {exc}"))
+                records.append(ToolCallRecord(name, payload, None))
                 continue
-            results.append(_tool_result(block.id, output, False))
-            records.append(ToolCallRecord(block.name, payload, output))
+            results.append(_tool_message(call.id, json.dumps(output, default=str)))
+            records.append(ToolCallRecord(name, payload, output))
         return results, records
 
 
-def _tool_result(tool_use_id: str, content: Any, is_error: bool) -> dict[str, Any]:
-    block: dict[str, Any] = {
-        "type": "tool_result",
-        "tool_use_id": tool_use_id,
-        "content": content if is_error else json.dumps(content, default=str),
+def _tool_arguments(call: Any) -> dict[str, Any]:
+    """The call's arguments, which arrive as a JSON *string*.
+
+    A model that emits malformed JSON gets an empty payload rather than an
+    exception: the tool then runs on its defaults, or reports its own error
+    back into the loop.
+    """
+    raw = getattr(call.function, "arguments", None) or "{}"
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return dict(parsed) if isinstance(parsed, dict) else {}
+
+
+def _assistant_turn(message: Any, calls: Sequence[Any]) -> dict[str, Any]:
+    return {
+        "role": "assistant",
+        "content": message.content or "",
+        "tool_calls": [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.function.name,
+                    "arguments": getattr(call.function, "arguments", None) or "{}",
+                },
+            }
+            for call in calls
+        ],
     }
-    if is_error:
-        block["is_error"] = True
-    return block
 
 
-def _reply_text(response: Any) -> str:
-    """Every text block of one response, concatenated."""
-    texts = [
-        str(block.text).strip()
-        for block in getattr(response, "content", None) or []
-        if getattr(block, "type", None) == "text" and getattr(block, "text", None)
-    ]
-    return "\n".join(text for text in texts if text)
+def _tool_message(tool_call_id: str, content: str) -> dict[str, Any]:
+    return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
