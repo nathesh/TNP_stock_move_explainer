@@ -41,7 +41,10 @@ def _at(month: int, day: int, hour: int, minute: int) -> datetime:
     return datetime(2025, month, day, hour, minute, tzinfo=UTC).replace(tzinfo=None)
 
 
-MOVE_KEYS = {
+#: Every key `move_to_dict` emitted in v1. Kept as its own set so the v1.5
+#: additions below are asserted as a *superset*: a client written against v1
+#: keeps every field it already read.
+V1_MOVE_KEYS = {
     "date",
     "ret",
     "ret_z",
@@ -62,17 +65,32 @@ MOVE_KEYS = {
     "explanation",
 }
 
-# (label, date, ret, ret_z, direction, routing)
+#: The five columns v1.5 decision 10 adds to the same dict.
+V15_MOVE_KEYS = {
+    "sub_routing",
+    "macro_driver",
+    "macro_driver_component",
+    "rival_comove",
+    "chain_comove",
+}
+
+MOVE_KEYS = V1_MOVE_KEYS | V15_MOVE_KEYS
+
+# (label, date, ret, ret_z, direction, routing, sub_routing)
 #
 # `c` is the only row that clears neither threshold (|z| 1.2, |ret| 0.01) and
 # `e` clears the percentage threshold alone (|z| 0.5, |ret| 0.025).
-MOVE_ROWS: tuple[tuple[str, date, float, float, str, str], ...] = (
-    ("a", date(2025, 2, 3), 0.05, 2.5, "up", "company"),
-    ("b", date(2025, 3, 10), -0.06, -3.1, "down", "macro"),
-    ("c", date(2025, 4, 15), 0.01, 1.2, "up", "industry"),
-    ("d", date(2025, 5, 20), -0.04, -2.2, "down", "company"),
-    ("e", date(2025, 6, 25), 0.025, 0.5, "up", "industry"),
-    ("f", date(2025, 8, 1), 0.08, 4.0, "up", "company"),
+#
+# The sub-buckets are chosen so the `country` prefix match has two rows to
+# find, two different countries to tell apart, and three non-country rows it
+# must not pick up.
+MOVE_ROWS: tuple[tuple[str, date, float, float, str, str, str | None], ...] = (
+    ("a", date(2025, 2, 3), 0.05, 2.5, "up", "company", "share_shift"),
+    ("b", date(2025, 3, 10), -0.06, -3.1, "down", "macro", "country:TW"),
+    ("c", date(2025, 4, 15), 0.01, 1.2, "up", "industry", None),
+    ("d", date(2025, 5, 20), -0.04, -2.2, "down", "company", "country:CN"),
+    ("e", date(2025, 6, 25), 0.025, 0.5, "up", "industry", "oil"),
+    ("f", date(2025, 8, 1), 0.08, 4.0, "up", "company", None),
 )
 
 
@@ -115,7 +133,7 @@ def seeded(session: Session) -> Seeded:
     )
 
     moves: dict[str, Move] = {}
-    for label, day, ret, ret_z, direction, routing in MOVE_ROWS:
+    for label, day, ret, ret_z, direction, routing, sub_routing in MOVE_ROWS:
         move = Move(
             ticker=TICKER,
             date=day,
@@ -126,9 +144,16 @@ def seeded(session: Session) -> Seeded:
             vol_z=1.5,
             idio_component=ret,
             peer_comove=0.01,
+            sub_routing=sub_routing,
         )
         session.add(move)
         moves[label] = move
+    # One row carries the rest of the v1.5 attribution, with a float long
+    # enough to prove the new numbers are rounded like the old ones.
+    moves["b"].macro_driver = "country:TW"
+    moves["b"].macro_driver_component = -0.0123456789
+    moves["b"].rival_comove = -0.0345678912
+    moves["b"].chain_comove = 0.0212345678
     session.commit()
     for move in moves.values():
         session.refresh(move)
@@ -405,6 +430,8 @@ def test_move_to_dict_keys_and_optional_articles(seeded: Seeded, session: Sessio
     move = seeded.moves["a"]
     bare = move_to_dict(move)
     assert set(bare) == MOVE_KEYS
+    # v1 clients keep every key they had; v1.5 only adds.
+    assert set(bare) >= V1_MOVE_KEYS
     assert bare["explanation"] is None
     assert bare["date"] == "2025-02-03"
     assert bare["direction"] == "up"
@@ -452,3 +479,52 @@ def test_serialisers_round_floats_and_drop_nan() -> None:
     assert payload["ret_z"] is None
     assert payload["vol_z"] is None
     assert payload["routing"] is None
+
+
+# --------------------------------------------------------------------------- #
+# v1.5: the sub-routing filter and the five new keys (decision 10)
+# --------------------------------------------------------------------------- #
+
+
+def test_sub_routing_is_an_exact_match(seeded: Seeded, session: Session) -> None:
+    assert _labels(list_moves(session, TICKER, MoveFilters(sub_routing="share_shift"))) == ["a"]
+    assert _labels(list_moves(session, TICKER, MoveFilters(sub_routing="country:CN"))) == ["d"]
+
+
+def test_bare_country_matches_every_country_sub_routing(seeded: Seeded, session: Session) -> None:
+    """The one prefix match. `a`, `e` and the two unset rows stay out."""
+    rows = list_moves(session, TICKER, MoveFilters(sub_routing="country"))
+    assert _labels(rows) == ["b", "d"]
+
+
+def test_sub_routing_combines_with_the_other_filters(seeded: Seeded, session: Session) -> None:
+    # `e` is a move only by |ret| >= 0.02, so it also proves the sub-bucket
+    # filter narrows the threshold result rather than replacing it.
+    assert _labels(list_moves(session, TICKER, MoveFilters(sub_routing="oil"))) == ["e"]
+    empty = MoveFilters(sub_routing="oil", direction="down")
+    assert list_moves(session, TICKER, empty) == []
+
+
+def test_an_unmatched_sub_routing_returns_nothing(seeded: Seeded, session: Session) -> None:
+    assert list_moves(session, TICKER, MoveFilters(sub_routing="supply_chain")) == []
+    # Blank is "no filter", not "rows with no sub-bucket".
+    assert len(list_moves(session, TICKER, MoveFilters(sub_routing="  "))) == 5
+
+
+def test_move_to_dict_carries_the_five_v15_keys(seeded: Seeded, session: Session) -> None:
+    payload = move_to_dict(seeded.moves["b"])
+
+    assert payload["sub_routing"] == "country:TW"
+    assert payload["macro_driver"] == "country:TW"
+    # Rounded by `_num`, exactly like every v1 float beside them.
+    assert payload["macro_driver_component"] == -0.012346
+    assert payload["rival_comove"] == -0.034568
+    assert payload["chain_comove"] == 0.021235
+
+    # A move with none of them set says so with nulls rather than dropping keys.
+    unset = move_to_dict(seeded.moves["c"])
+    assert unset["sub_routing"] is None
+    assert unset["macro_driver"] is None
+    assert unset["macro_driver_component"] is None
+    assert unset["rival_comove"] is None
+    assert unset["chain_comove"] is None

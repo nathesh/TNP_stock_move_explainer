@@ -40,6 +40,82 @@ to a real tool-calling loop); if a model call fails the app degrades to the
 heuristic instead of erroring, and the stored explanation is labelled with the
 provider that actually wrote it.
 
+## v1.5: the relationship layer
+
+Today the app knows one fact per company: its peers. v1.5 stores a short list of
+typed facts per company (competitors, suppliers, customers, countries, and
+price-derived factor betas), and a small table of dated geopolitical headline
+counts per country. It uses them in exactly two places: routing (a move gets a
+`sub_routing` such as `share_shift`, `supply_chain`, `oil`, `country:TW`) and
+retrieval (the news query expands along the edges). One gate rule stops
+geopolitical headlines from being credited unless the company has the country
+edge and the country's factor actually moved that day.
+
+**The edges are one table and one read.** `company_edges(src, dst, relation,
+weight, source)` holds all five relations; `competitor` replaces the old peer
+list rather than sitting beside it. `GET /tickers/{ticker}/relations` returns
+them, filterable with `?relation=`:
+
+```bash
+curl -s 'http://127.0.0.1:8000/tickers/NVDA/relations' | python -m json.tool
+curl -s 'http://127.0.0.1:8000/tickers/NVDA/relations?relation=country' | python -m json.tool
+```
+
+```json
+{
+  "ticker": "NVDA",
+  "edges": [
+    {"dst": "AMD", "relation": "competitor", "weight": 0.9, "source": "model"},
+    {"dst": "TSM", "relation": "supplier", "weight": 0.8, "source": "model"},
+    {"dst": "TW",  "relation": "country",   "weight": 0.7, "source": "model"},
+    {"dst": "oil", "relation": "factor",    "weight": -0.11, "source": "prices"}
+  ]
+}
+```
+
+It is a pure read: edges are written by an ingest, and asking for them is not
+asking to go and build them, so a stored ticker with none answers `[]`.
+
+**Five new fields on every move.** `sub_routing` is the sub-bucket inside the
+unchanged `company|industry|macro` routing — `share_shift` when competitors
+moved the *opposite* way, `supply_chain` when suppliers or customers moved the
+*same* way, and `oil|dollar|rates|gold|country:XX` on a macro day — and it is
+`null` when no rule fires. `macro_driver` and `macro_driver_component` name the
+factor proxy with the largest contribution that day (`USO`, `UUP`, `TLT`, `GLD`
+and one country ETF per country edge) and how much of the move it accounts for,
+counted only when the proxy itself moved (`abs(z) >= 1.5`). `rival_comove` and
+`chain_comove` are the same-day average returns of the `competitor` edges and of
+the `supplier`/`customer` edges — the two numbers `sub_routing` is read off.
+
+**The gate rule, in one sentence.** A headline matching the geopolitical
+vocabulary is capped at relevance `0.30` unless *both* hold — the title names a
+country the company has a `country` edge to, and the move's `macro_driver` is
+that country or `oil`/`dollar` — so a tariff story is never credited for a move
+the exposure and the prices do not both support.
+
+**No key means no country edges, so the geo gate stays closed.** Country,
+supplier and customer edges come from one `suggest_relations` call per company;
+the keyless provider returns competitors from the sector ETF's holdings and
+nothing else. So without a working key there is no country to match, the gate
+never opens, and no `country:XX` sub-routing can fire. That is the honest
+behaviour rather than a bug, and it is why the smoke check below comes first.
+
+**Run the smoke check first, then the eval.** `scripts/smoke_model.py` is the
+first thing to run on any machine: it makes one call through the app's own
+provider path and one raw SDK call, because the providers degrade to the
+heuristic on any exception, so a dead key otherwise looks like a quiet answer
+(exit 0 proven, 1 degraded or failed, 2 no key configured). `scripts/eval_v15.py`
+then runs the three ticker-days fixed in `docs/v1.5-plan.md` before the build —
+NVDA 2025-04-16, NVDA 2025-01-27, AAPL 2025-04-03 — printing each move's
+numbers, prose and cited headlines, and judging `routing` and `sub_routing`
+separately. It uses the network, is not part of pytest, and ingests into a fresh
+temporary database unless given `--db PATH`:
+
+```bash
+uv run python scripts/smoke_model.py
+uv run python scripts/eval_v15.py
+```
+
 ## Setup
 
 ```bash
@@ -85,13 +161,19 @@ and each is a consequence of how serverless hosting differs from a laptop:
   this file is the bridge.
 - **`DB_PATH=/tmp/app.db`** (set in `vercel.json`). The filesystem is read-only
   apart from `/tmp`, so the default `data/app.db` cannot be written.
-- **`data/snapshot.db.gz`**, a pre-ingested database of ~110 large caps, one
-  year each. `/tmp` is per-instance and wiped on a cold start, so without a
+- **`data/snapshot.db.gz`**, a pre-ingested database of ~110 large caps, two
+  years each. `/tmp` is per-instance and wiped on a cold start, so without a
   seed the first visitor would meet an empty page; `stock_moves.seed` expands
   the snapshot when no database is present. Rebuild it with
   `uv run python scripts/build_snapshot.py`. After a change to the phrasing,
   `uv run python scripts/renarrate_snapshot.py` rewrites the snapshot's keyless
   explanations in place and re-gzips it, off the network and without a key.
+
+  **The snapshot must be rebuilt for v1.5.** The committed one predates the
+  relationship layer: one year of data, null regimes, and none of the new
+  tables or columns. Delete the working `data/snapshot.db` first — schema
+  creation adds missing tables but never columns to an existing one — then
+  rerun `scripts/build_snapshot.py`, which now ingests two years.
 
 ```bash
 vercel deploy          # preview
@@ -111,18 +193,20 @@ until the next rebuild — a request for a stale ticker re-ingests it live.
 
 ## API, by example
 
-Ingest a year of prices, detect the moves, fetch and score news, and explain
-the five biggest:
+Ingest two years of prices, detect the moves, fetch and score news, and
+explain the five biggest (two years, not one, so the 200-day SMA behind the
+regime labels has warmed up):
 
 ```bash
-curl -s -X POST 'http://127.0.0.1:8000/tickers/AAPL/ingest?period=1y&top_n=5' | python -m json.tool
+curl -s -X POST 'http://127.0.0.1:8000/tickers/AAPL/ingest?period=2y&top_n=5' | python -m json.tool
 ```
 
 ```json
 {
-  "ticker": "AAPL", "period": "1y", "top_n": 5,
-  "n_prices": 251, "n_moves": 43, "n_articles": 150, "n_explanations": 5,
-  "provider": "openai", "news_source": "google_rss"
+  "ticker": "AAPL", "period": "2y", "top_n": 5,
+  "n_prices": 502, "n_moves": 86, "n_articles": 291, "n_explanations": 5,
+  "provider": "openai", "news_source": "google_rss",
+  "n_edges": 14, "n_geo_events": 3
 }
 ```
 

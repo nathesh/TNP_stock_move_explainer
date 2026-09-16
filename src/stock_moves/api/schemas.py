@@ -32,10 +32,12 @@ __all__ = [
     "ChatRequest",
     "ChatResponse",
     "CompanyOut",
+    "EdgeOut",
     "ExplanationOut",
     "IngestResponse",
     "MoveOut",
     "PriceOut",
+    "RelationsResponse",
     "TickerResponse",
     "ToolCallOut",
     "WindowOut",
@@ -108,6 +110,23 @@ class ArticleOut(_Schema):
     category: str | None = None
 
 
+class EdgeOut(_Schema):
+    """One typed fact about a company (v1.5 decision 1).
+
+    `src` is absent by design: every payload carrying these has already named
+    the ticker they belong to. `dst` is a ticker for `competitor`, `supplier`
+    and `customer`, an ISO-3166 alpha-2 code for `country`, and a factor name
+    (`oil`, `dollar`, `rates`, `gold`) for `factor`; `weight` is whatever
+    strength the `source` reported — a model confidence, an ETF holding share
+    or a fitted beta — and is not a probability.
+    """
+
+    dst: str
+    relation: str
+    weight: float = 1.0
+    source: str | None = None
+
+
 class ExplanationOut(_Schema):
     """The cached, cited explanation of one move (DESIGN section 4)."""
 
@@ -140,6 +159,13 @@ class MoveOut(_Schema):
     sector_component: float | None = None
     idio_component: float | None = None
     peer_comove: float | None = None
+    # v1.5 decision 10. Absent on a v1 row, which is why every one of them
+    # defaults: the same model validates a move stored before the migration.
+    sub_routing: str | None = None
+    macro_driver: str | None = None
+    macro_driver_component: float | None = None
+    rival_comove: float | None = None
+    chain_comove: float | None = None
     explanation: ExplanationOut | None = None
     articles: list[ArticleOut] = Field(default_factory=list)
 
@@ -169,6 +195,21 @@ class IngestResponse(_Schema):
     n_explanations: int
     provider: str
     news_source: str
+    #: v1.5. Defaulted so a payload written by the v1 shape still validates.
+    n_edges: int = 0
+    n_geo_events: int = 0
+
+
+class RelationsResponse(_Schema):
+    """`GET /tickers/{ticker}/relations` (v1.5 decision 10).
+
+    The one read v1.5 adds. An empty `edges` is a real answer rather than a
+    404: the ticker is stored, and no key means no model relations — and the
+    ETF fallback for `competitor` can come back empty too.
+    """
+
+    ticker: str
+    edges: list[EdgeOut] = Field(default_factory=list)
 
 
 class ChatRequest(_Schema):

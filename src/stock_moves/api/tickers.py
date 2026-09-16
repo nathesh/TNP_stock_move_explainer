@@ -1,6 +1,6 @@
 """Ticker routes: lazy population (DESIGN section 5) and reads (DESIGN section 6).
 
-Three routes, and between them they own exactly two decisions.
+Four routes, and between them they own exactly two decisions.
 
 1. **When to ingest.** DESIGN section 5 makes population lazy: a read ingests
    when the ticker has never been seen, when the newest stored bar is older
@@ -20,6 +20,11 @@ same dicts the chat tools hand a model), and the response models only validate
 and document them. So these handlers are argument plumbing plus the freshness
 rule, which is the whole point of keeping them thin.
 
+The fourth route, `GET /{ticker}/relations` (v1.5 decision 10), is the one
+exception to the first decision: it is a pure read that never ingests, because
+edges are a by-product of an ingest rather than something a window of them can
+be computed for on demand.
+
 `ingest.get_news_source` is called through the module rather than imported by
 name so that monkeypatching `stock_moves.ingest.get_news_source` in a test
 reaches the on-demand enrichment path here too, exactly as it reaches
@@ -34,9 +39,15 @@ from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 
-from stock_moves import ingest, prices
+from stock_moves import ingest, ontology, prices
 from stock_moves.api.deps import get_db, get_provider_dep, get_settings_dep
-from stock_moves.api.schemas import CompanyOut, IngestResponse, MoveOut, TickerResponse
+from stock_moves.api.schemas import (
+    CompanyOut,
+    IngestResponse,
+    MoveOut,
+    RelationsResponse,
+    TickerResponse,
+)
 from stock_moves.db import Session
 from stock_moves.ingest import (
     IngestResult,
@@ -89,6 +100,11 @@ DEFAULT_LIMIT = 50
 
 Direction = Literal["up", "down"]
 Category = Literal["company", "industry", "macro", "unexplained"]
+#: The `company_edges.relation` values, as a filter on the relations read.
+#: Spelled out rather than taken from `models.EDGE_RELATIONS` because FastAPI
+#: needs a literal type at import, and a wrong value is then a 422 with the
+#: five names in it instead of a silently empty list.
+Relation = Literal["competitor", "supplier", "customer", "country", "factor"]
 
 
 # --------------------------------------------------------------------------- #
@@ -206,6 +222,16 @@ def read_ticker(
     pct_threshold: Annotated[float, Query(ge=0.0)] = DEFAULT_PCT_THRESHOLD,
     direction: Annotated[Direction | None, Query()] = None,
     category: Annotated[Category | None, Query()] = None,
+    sub_routing: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Stored sub-bucket: share_shift, supply_chain, oil, dollar, "
+                "rates, gold or country:XX. The bare value 'country' matches "
+                "every country:XX."
+            )
+        ),
+    ] = None,
     min_relevance: Annotated[float, Query(ge=0.0, le=1.0)] = 0.0,
     include_prices: Annotated[bool, Query()] = False,
     include_news: Annotated[bool, Query()] = True,
@@ -256,6 +282,7 @@ def read_ticker(
         pct_threshold=pct_threshold,
         direction=direction,
         category=category,
+        sub_routing=sub_routing,
         min_relevance=min_relevance,
         limit=limit,
     )
@@ -285,6 +312,7 @@ def read_ticker(
                 "pct_threshold": pct_threshold,
                 "direction": direction,
                 "category": category,
+                "sub_routing": sub_routing,
                 "min_relevance": min_relevance,
                 "include_prices": include_prices,
                 "include_news": include_news,
@@ -300,6 +328,33 @@ def read_ticker(
                 else None
             ),
         }
+    )
+
+
+@router.get("/{ticker}/relations", response_model=RelationsResponse)
+def read_relations(
+    ticker: TickerPath,
+    session: SessionDep,
+    relation: Annotated[
+        Relation | None,
+        Query(description="Keep only this relation; omit for all five."),
+    ] = None,
+) -> RelationsResponse:
+    """The company's stored relationship edges (v1.5 decision 10).
+
+    A pure read: unlike the two routes around it this one never ingests,
+    because edges are written by an ingest rather than derived from a window,
+    and a request for them is not a request to go and build them. So the 404
+    is the plain "this ticker has no stored data at all" of `_require_company`,
+    and a ticker that *is* stored with no edges answers `[]` — which is the
+    expected answer with no key, where the model relations are empty and the
+    ETF fallback may be too (v1.5 decision 3).
+    """
+    key = _key(ticker)
+    _require_company(session, key)
+    edges = ontology.edges_of(session, key, relation)
+    return RelationsResponse.model_validate(
+        {"ticker": key, "edges": ontology.edges_to_dicts(edges)}
     )
 
 

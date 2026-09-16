@@ -15,6 +15,7 @@ from stock_moves.ontology import (
     country_codes,
     edges_of,
     edges_to_dicts,
+    fetch_relations,
     get_or_build_company,
     peers_of,
     relation_tickers,
@@ -246,6 +247,30 @@ def test_peers_of(session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# fetch_relations
+# --------------------------------------------------------------------------- #
+
+
+def test_fetch_relations_returns_the_providers_answer_in_one_call(session: Session) -> None:
+    company = _company(session)
+    provider = _StubProvider(relations=MODEL_RELATIONS)
+
+    assert fetch_relations(company, provider) == MODEL_RELATIONS
+    assert provider.relation_calls == 1
+    assert provider.calls == 0
+
+
+def test_fetch_relations_survives_a_failing_provider(session: Session) -> None:
+    company = _company(session)
+    provider = _StubProvider(raises=True)
+
+    assert fetch_relations(company, provider) == Relations(
+        competitors=(), suppliers=(), customers=(), countries=()
+    )
+    assert provider.relation_calls == 1
+
+
+# --------------------------------------------------------------------------- #
 # build_edges
 # --------------------------------------------------------------------------- #
 
@@ -352,6 +377,54 @@ def test_factor_betas_none_leaves_factor_rows_untouched(session: Session) -> Non
 
     build_edges(session, company, _StubProvider(), {})
     assert _rows(session, "factor") == []
+
+
+def test_build_edges_reuses_supplied_relations_without_calling_the_model(
+    session: Session,
+) -> None:
+    """`relations=` is the answer already fetched: the provider is never asked.
+
+    This is what makes an ingest that builds twice — country edges before
+    prices, factor edges after — cost one `suggest_relations` call and not two.
+    """
+    company = _company(session, ["ETF1"])
+    provider = _StubProvider(relations=MODEL_RELATIONS)
+    relations = fetch_relations(company, provider)
+    assert provider.relation_calls == 1
+
+    build_edges(session, company, provider, relations=relations)
+    build_edges(session, company, provider, {"oil": 0.8}, relations=relations)
+
+    # Still the one call made by `fetch_relations` above.
+    assert provider.relation_calls == 1
+    assert _rows(session) == [
+        ("competitor", "AMD", 1.0, "model"),
+        ("competitor", "INTC", 1.0, "model"),
+        ("country", "CN", 0.25, "model"),
+        ("country", "TW", 0.4, "model"),
+        ("customer", "MSFT", 1.0, "model"),
+        ("factor", "oil", 0.8, "prices"),
+        ("supplier", "TSM", 1.0, "model"),
+    ]
+
+
+def test_supplied_empty_relations_still_fall_back_to_etf_competitors(session: Session) -> None:
+    """The ETF fallback is a property of the answer, not of who fetched it."""
+    company = _company(session, ["ETF1", "ETF2"])
+    provider = _StubProvider(relations=MODEL_RELATIONS)
+
+    build_edges(
+        session,
+        company,
+        provider,
+        relations=Relations(competitors=(), suppliers=(), customers=(), countries=()),
+    )
+
+    assert provider.relation_calls == 0
+    assert _rows(session) == [
+        ("competitor", "ETF1", 1.0, "etf_holdings"),
+        ("competitor", "ETF2", 1.0, "etf_holdings"),
+    ]
 
 
 # --------------------------------------------------------------------------- #

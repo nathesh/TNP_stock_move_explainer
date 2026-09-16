@@ -28,11 +28,14 @@ worth reading on its own:
 table, the factor attribution and the geopolitical counts are all built by
 other modules; this one is where they meet the run, in one fixed order:
 
-1. `ontology.build_edges` twice. The first call needs no prices and gives us
-   the `country` edges; only then do we know which country ETFs to fetch, so
-   the fitted factor betas — which are the `factor` edges — can only be handed
-   to a second call. The two-call shape is the price of deriving factor
-   exposure from prices rather than asking a model for it (plan decision 4).
+1. `ontology.fetch_relations` once, then `ontology.build_edges` twice with
+   that one answer. The first build needs no prices and gives us the `country`
+   edges; only then do we know which country ETFs to fetch, so the fitted
+   factor betas — which are the `factor` edges — can only be handed to a second
+   build. The two-build shape is the price of deriving factor exposure from
+   prices rather than asking a model for it (plan decision 4); fetching the
+   model's answer once and passing it down is what keeps that price at zero
+   extra model calls — one `suggest_relations` per run, not two.
 2. `build_features(..., factors=...)`, so every stored price row carries
    `macro_driver` and `macro_driver_component`.
 3. `moves.sub_route` per detected move, from the competitor and
@@ -88,6 +91,7 @@ from stock_moves.news import geo as news_geo
 from stock_moves.ontology import (
     build_edges,
     country_codes,
+    fetch_relations,
     get_or_build_company,
     relation_tickers,
 )
@@ -832,17 +836,18 @@ def ingest_ticker(
         # 1. Ontology: identity, sector ETF and peers, cached per company.
         company = get_or_build_company(session, key, model, refresh=refresh)
 
-        # 1b. Edges, built in two calls and deliberately so (v1.5 decision 4).
-        #     The first call is the model's answer — competitor / supplier /
-        #     customer / country — and it has to come first because the country
-        #     edges are what decide which country ETFs are worth fetching. Only
-        #     once those returns are in can the betas be fitted, so the `factor`
-        #     edges can only be written by a second call. `build_edges` is
-        #     replace-all per relation and the model's answer is cached inside
-        #     it for the run, so the second call rewrites the same four
-        #     relations to the same rows and adds the fifth; nothing
-        #     accumulates and nothing is duplicated.
-        build_edges(session, company, model, factor_betas=None)
+        # 1b. Edges, written in two passes and deliberately so (v1.5 decision
+        #     4). The model is asked exactly once, here: the answer —
+        #     competitor / supplier / customer / country — has to be in hand
+        #     first because the country edges are what decide which country
+        #     ETFs are worth fetching. Only once those returns are in can the
+        #     betas be fitted, so the `factor` edges can only be written by a
+        #     second pass. Both passes are handed the same `Relations`, so the
+        #     second costs no model call; `build_edges` is replace-all per
+        #     relation, so it rewrites the same four relations to the same rows
+        #     and adds the fifth. Nothing accumulates and nothing is duplicated.
+        relations = fetch_relations(company, model)
+        build_edges(session, company, model, factor_betas=None, relations=relations)
 
         # 2. Inputs. The stock is required; the market and the sector ETF are
         #    the decomposition's regressors, and only the ETF is optional.
@@ -862,7 +867,13 @@ def ingest_ticker(
         has_factors = not factor_returns.empty
         if has_factors:
             betas = factor_betas(compute_returns(stock)["ret"], factor_returns)
-            build_edges(session, company, model, factor_betas=_latest_betas(betas))
+            build_edges(
+                session,
+                company,
+                model,
+                factor_betas=_latest_betas(betas),
+                relations=relations,
+            )
 
         # 3. Features -> prices. With factors, every row also carries the
         #    `macro_driver` attribution (`moves.FACTOR_COLUMNS`).

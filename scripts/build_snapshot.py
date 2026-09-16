@@ -1,5 +1,16 @@
 """Build the committed demo snapshot: `data/snapshot.db.gz`.
 
+**Rerun this after v1.5.** The schema gained tables (`company_edges`,
+`geo_events`) and columns (`sub_routing`, `macro_driver`,
+`macro_driver_component`, `rival_comove`, `chain_comove` on `moves`;
+`macro_driver` and `macro_driver_component` on `prices`; `geo_gate` on
+`move_articles`), and the committed snapshot predates all of them: it holds one
+year of data with null regimes, built when `PERIOD` was `1y`. Schema creation is
+`init_db()`, i.e. the app's own `SQLModel.metadata.create_all`, so the new
+tables appear by themselves — but `create_all` adds *tables*, never columns to
+an existing one, so a v1 `data/snapshot.db` left in place would be reused and
+would fail on the new columns. Delete `data/snapshot.db` before the rebuild.
+
 Ingests a broad, liquid slice of the US large-cap market — every sector the
 routing logic can choose between — and gzips the resulting SQLite file so a
 deployed instance can seed itself in one decompression (`stock_moves.seed`).
@@ -45,7 +56,10 @@ from stock_moves.queries import has_prices
 WORKING_DB = REPO_ROOT / "data" / "snapshot.db"
 SNAPSHOT_GZ = REPO_ROOT / "data" / "snapshot.db.gz"
 
-PERIOD = "1y"
+#: Two years, matching `Settings.default_period`: `regime_mkt` / `regime_sector`
+#: need a 200-day SMA before they can label a day, so a 1y snapshot shipped with
+#: the first months null and the rest barely warmed up.
+PERIOD = "2y"
 TOP_N = 5
 
 #: ~100 of the most-traded US names, spread across every sector in the ETF

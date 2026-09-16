@@ -65,6 +65,13 @@ _DAY_END = time(23, 59, 59, 999999)
 #: falling back to a ranking the reader did not ask for.
 _ORDERS: frozenset[str] = frozenset({"z", "pct"})
 
+#: The `sub_routing` values that name a country are `country:XX` (v1.5
+#: decision 6), so the family is asked for by the prefix and one member by the
+#: whole string. Kept here rather than imported from `moves` because this
+#: module deliberately depends on `models` alone.
+_COUNTRY_BUCKET = "country"
+_COUNTRY_SUB_ROUTING = f"{_COUNTRY_BUCKET}:"
+
 
 @dataclass
 class MoveFilters:
@@ -84,6 +91,13 @@ class MoveFilters:
     about); `"pct"` ranks by the raw size of the percentage move, which is what
     a reader asking for the biggest fall means. The two disagree often enough
     to matter: a -3.5% day in a quiet stretch outranks a -7.4% day on z.
+
+    `sub_routing` (v1.5 decision 6) filters on the stored sub-bucket and is an
+    exact match, with one deliberate exception: the bare value `"country"`
+    matches every `country:XX`. The sub-bucket names a country because the
+    *driver* is a country, and "the days a country drove" is the question a
+    reader actually asks — naming the code is the narrower follow-up, and
+    `sub_routing="country:TW"` still answers it.
     """
 
     start: date | None = None
@@ -92,6 +106,7 @@ class MoveFilters:
     pct_threshold: float = 0.02
     direction: str | None = None
     category: str | None = None
+    sub_routing: str | None = None
     min_relevance: float = 0.0
     limit: int = 50
     order: str = "z"
@@ -199,6 +214,13 @@ def list_moves(session: Session, ticker: str, filters: MoveFilters) -> list[Move
     )
     if filters.direction:
         statement = statement.where(col(Move.direction) == filters.direction)
+    sub_routing = (filters.sub_routing or "").strip()
+    if sub_routing:
+        statement = statement.where(
+            col(Move.sub_routing).startswith(_COUNTRY_SUB_ROUTING)
+            if sub_routing == _COUNTRY_BUCKET
+            else col(Move.sub_routing) == sub_routing
+        )
     if filters.category:
         statement = statement.outerjoin(
             Explanation, col(Explanation.move_id) == col(Move.id)
@@ -420,6 +442,14 @@ def move_to_dict(
         "vol_z": _num(m.vol_z),
         "direction": m.direction,
         "routing": m.routing,
+        # v1.5 decision 10: the sub-bucket, the factor-proxy attribution behind
+        # it and the two co-movements it is decided from, so a reader of this
+        # dict can check the sub-routing rather than take it on trust.
+        "sub_routing": m.sub_routing,
+        "macro_driver": m.macro_driver,
+        "macro_driver_component": _num(m.macro_driver_component),
+        "rival_comove": _num(m.rival_comove),
+        "chain_comove": _num(m.chain_comove),
         "near_earnings": bool(m.near_earnings),
         "near_fomc": bool(m.near_fomc),
         "near_cpi": bool(m.near_cpi),

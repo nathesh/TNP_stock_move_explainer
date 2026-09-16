@@ -29,11 +29,13 @@ from stock_moves.models import (
     Article,
     ChatMessage,
     Company,
+    CompanyEdge,
     Explanation,
     Move,
     MoveArticle,
 )
 from stock_moves.providers import TOOL_SPECS, ChatReply, ChatTurn, ToolCallRecord, ToolFn
+from stock_moves.providers.heuristic import HeuristicProvider
 
 TICKER = "TEST"
 MOVE_DATE = date(2025, 6, 3)
@@ -609,3 +611,205 @@ def test_get_move_refuses_a_relative_day(session: Session) -> None:
     tools = chat_route.make_tools(session, TICKER)
     with pytest.raises(ValueError):
         tools["get_move"](date="yesterday")
+
+
+# --------------------------------------------------------------------------- #
+# v1.5: the `get_relations` tool (decision 10)
+# --------------------------------------------------------------------------- #
+
+#: One of each relation, so the tool's payload proves it returns the whole
+#: edge row rather than a list of tickers.
+EDGE_ROWS: tuple[tuple[str, str, float, str], ...] = (
+    ("AMD", "competitor", 0.8, "model"),
+    ("TSM", "supplier", 0.7, "model"),
+    ("TW", "country", 0.3, "model"),
+    ("oil", "factor", -0.45, "prices"),
+)
+
+
+def _seed_with_edges(session: Session) -> None:
+    """The one company of `_seed`, plus its edges."""
+    _seed(session)
+    for dst, relation, weight, source in EDGE_ROWS:
+        session.add(
+            CompanyEdge(src=TICKER, dst=dst, relation=relation, weight=weight, source=source)
+        )
+    session.commit()
+
+
+class RelationAskingProvider:
+    """A provider that answers every turn with one `get_relations` call.
+
+    The same stand-in shape as `DateInventingProvider`: the heuristic router
+    never picks this tool (it has no keyword for it), so the only way to drive
+    the binding end to end through the real dependency graph is a fake model
+    that asks for it.
+    """
+
+    name = "relation-asking"
+
+    def __init__(self, ticker_argument: str | None = None) -> None:
+        self.sent: list[dict[str, Any]] = []
+        self.ticker_argument = ticker_argument
+
+    def chat(
+        self,
+        history: Sequence[ChatTurn],
+        tools: Mapping[str, ToolFn],
+        ticker: str | None,
+    ) -> ChatReply:
+        payload: dict[str, Any] = {}
+        if self.ticker_argument is not None:
+            payload["ticker"] = self.ticker_argument
+        self.sent.append(dict(payload))
+        output = tools["get_relations"](**payload)
+        edges = output["edges"]
+        return ChatReply(f"{len(edges)} edges.", [ToolCallRecord("get_relations", payload, output)])
+
+    def score_articles(self, move: Any, articles: Any) -> list[Any]:  # pragma: no cover
+        return []
+
+    def explain(self, move: Any, scored: Any) -> Any:  # pragma: no cover
+        raise NotImplementedError
+
+    def suggest_peers(self, *args: Any, **kwargs: Any) -> list[str]:  # pragma: no cover
+        return []
+
+
+@pytest.fixture
+def relation_provider() -> RelationAskingProvider:
+    return RelationAskingProvider()
+
+
+@pytest.fixture
+def relations_client(
+    no_api_key: None,
+    frozen_today: None,
+    relation_provider: RelationAskingProvider,
+) -> Iterator[TestClient]:
+    """The seeded company with edges, answered by the relation-asking provider."""
+    yield from _frozen_client(_seed_with_edges, relation_provider)
+
+
+def test_make_tools_exposes_exactly_the_advertised_tool_names(session: Session) -> None:
+    """The bindings and `TOOL_SPECS` are one list, not two that drift."""
+    assert set(chat_route.make_tools(session, TICKER)) == {spec["name"] for spec in TOOL_SPECS}
+
+
+def test_get_relations_returns_the_stored_edges(relations_client: TestClient) -> None:
+    response = relations_client.post(
+        "/chat", json={"message": "who does TEST compete with?", "ticker": TICKER}
+    )
+    assert response.status_code == 200, response.text
+
+    call = response.json()["tool_calls"][0]
+    assert call["name"] == "get_relations"
+    output = call["output"]
+    assert output["ticker"] == TICKER
+    # Ordered by relation then dst, and every edge is the full row.
+    assert [(edge["relation"], edge["dst"]) for edge in output["edges"]] == [
+        ("competitor", "AMD"),
+        ("country", "TW"),
+        ("factor", "oil"),
+        ("supplier", "TSM"),
+    ]
+    assert output["edges"][0] == {
+        "dst": "AMD",
+        "relation": "competitor",
+        "weight": 0.8,
+        "source": "model",
+    }
+    assert response.json()["reply"] == "4 edges."
+
+
+def test_get_relations_takes_no_window(relations_client: TestClient) -> None:
+    """Edges are facts about the company, not about a day, so a phrase in the
+    question must not add dates to the recorded call."""
+    response = relations_client.post(
+        "/chat", json={"message": "who does TEST supply this year?", "ticker": TICKER}
+    )
+    assert response.status_code == 200, response.text
+
+    recorded = response.json()["tool_calls"][0]["input"]
+    assert "start" not in recorded
+    assert "end" not in recorded
+    # The window was still resolved and reported; it simply narrows nothing here.
+    assert response.json()["window"]["phrase"] == "this year"
+
+
+def test_get_relations_falls_back_to_the_session_ticker(
+    relations_client: TestClient, relation_provider: RelationAskingProvider
+) -> None:
+    relations_client.post("/chat", json={"message": "relations?", "ticker": TICKER})
+
+    assert relation_provider.sent == [{}]
+
+
+def test_get_relations_of_a_ticker_with_no_edges_is_an_empty_list(
+    no_api_key: None,
+    frozen_today: None,
+) -> None:
+    """The keyless answer, and it is not an error: `HeuristicProvider` names no
+    relations at all (v1.5 decision 3)."""
+    provider = RelationAskingProvider()
+    for test_client in _frozen_client(_seed, provider):
+        response = test_client.post("/chat", json={"message": "relations?", "ticker": TICKER})
+        assert response.status_code == 200, response.text
+        assert response.json()["tool_calls"][0]["output"] == {"ticker": TICKER, "edges": []}
+
+
+def test_get_relations_without_a_ticker_anywhere_is_a_message_not_a_crash(
+    session: Session,
+) -> None:
+    tools = chat_route.make_tools(session, None)
+    with pytest.raises(ValueError):
+        tools["get_relations"]()
+
+
+def test_the_heuristic_renderer_survives_the_new_tool() -> None:
+    """The keyless renderer has no `get_relations` branch and does not need one
+    to stay up: its keyword router never selects the tool, and an unknown name
+    falls through to the news rendering, which finds no `articles` key and says
+    so. The follow-up — a branch that reads the edges out loud — belongs in
+    `providers/heuristic.py`, which this task does not own.
+    """
+    payload = {
+        "ticker": TICKER,
+        "edges": [{"dst": "AMD", "relation": "competitor", "weight": 0.8, "source": "model"}],
+    }
+
+    rendered = HeuristicProvider()._render("get_relations", TICKER, {"ticker": TICKER}, payload)
+
+    assert isinstance(rendered, str)
+    assert rendered
+
+
+def test_the_heuristic_router_never_picks_get_relations(client: TestClient) -> None:
+    """Every question the keyword router knows reaches one of the other three."""
+    for message in (
+        f"why did {TICKER} drop on {MOVE_DATE}?",
+        f"any news on {TICKER}",
+        f"biggest {TICKER} falls",
+        f"who competes with {TICKER}?",
+    ):
+        body = client.post("/chat", json={"message": message, "ticker": TICKER}).json()
+        names = {call["name"] for call in body["tool_calls"]}
+        assert "get_relations" not in names
+
+
+def test_moves_in_chat_carry_the_five_v15_keys(client: TestClient) -> None:
+    """`move_to_dict` is what the tools hand the model, so the new columns
+    reach the model the same day they reach the API."""
+    body = client.post(
+        "/chat", json={"message": f"what happened to {TICKER} on {MOVE_DATE}?"}
+    ).json()
+
+    output = body["tool_calls"][0]["output"]
+    for key in (
+        "sub_routing",
+        "macro_driver",
+        "macro_driver_component",
+        "rival_comove",
+        "chain_comove",
+    ):
+        assert key in output, key

@@ -29,12 +29,14 @@ from typing import Any
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
+from sqlmodel import col, select
 from synth import synthetic_ohlcv
 
 from stock_moves import ingest, prices
 from stock_moves.api import deps
 from stock_moves.api.app import create_app
-from stock_moves.db import configure_engine
+from stock_moves.db import Session, configure_engine, get_engine
+from stock_moves.models import CompanyEdge, Move
 from stock_moves.news import NewsItem
 from stock_moves.prices import PriceFetchError, TickerInfo
 
@@ -51,6 +53,51 @@ SHOCK_RETURN = -0.08
 
 COMPANY_HEADLINE = "Test Corp shares plunge after a guidance cut"
 MACRO_HEADLINE = "Broad market selloff as Treasury yields jump"
+
+#: The edges seeded for the relations read: one of every relation the plan
+#: defines, so the filter has something to exclude in each direction and the
+#: ordering (relation, then dst) has two rows inside one relation to sort.
+EDGE_ROWS: tuple[tuple[str, str, float, str], ...] = (
+    ("AMD", "competitor", 0.8, "model"),
+    ("INTC", "competitor", 0.4, "etf_holdings"),
+    ("TSM", "supplier", 0.7, "model"),
+    ("MSFT", "customer", 0.6, "model"),
+    ("TW", "country", 0.3, "model"),
+    ("CN", "country", 0.2, "model"),
+    ("oil", "factor", -0.45, "prices"),
+)
+
+#: Every key `MoveOut` carried in v1; the v1.5 read must still carry them all.
+V1_MOVE_KEYS = (
+    "date",
+    "ret",
+    "ret_z",
+    "gap_ret",
+    "intraday_ret",
+    "vol_z",
+    "direction",
+    "routing",
+    "near_earnings",
+    "near_fomc",
+    "near_cpi",
+    "regime_mkt",
+    "regime_sector",
+    "mkt_component",
+    "sector_component",
+    "idio_component",
+    "peer_comove",
+    "explanation",
+    "articles",
+)
+
+#: The five v1.5 decision 10 adds to it.
+V15_MOVE_KEYS = (
+    "sub_routing",
+    "macro_driver",
+    "macro_driver_component",
+    "rival_comove",
+    "chain_comove",
+)
 
 #: Every column DESIGN section 1 says is computed and stored per trading day.
 DESIGN_PRICE_COLUMNS = (
@@ -196,6 +243,39 @@ def move_on(payload: dict[str, Any], on: date) -> dict[str, Any]:
     """The move for one date out of a ticker payload."""
     wanted = on.isoformat()
     return next(move for move in payload["moves"] if move["date"] == wanted)
+
+
+def seed_edges() -> None:
+    """Write `EDGE_ROWS` for the ticker on a fresh session.
+
+    Edges are written by an ingest from a model call, and the keyless provider
+    names none (v1.5 decision 3), so a test that wants edges to read has to put
+    them there itself — which is also what keeps this an assertion about the
+    route rather than about the provider.
+    """
+    with Session(get_engine()) as session:
+        for dst, relation, weight, source in EDGE_ROWS:
+            session.add(
+                CompanyEdge(src=TICKER, dst=dst, relation=relation, weight=weight, source=source)
+            )
+        session.commit()
+
+
+def set_sub_routing(assignments: dict[str, str]) -> None:
+    """Stamp `sub_routing` onto stored moves, keyed by ISO date.
+
+    Same reason as `seed_edges`: without a key the routing layer has no
+    competitor or country edges to decide a sub-bucket from, so the filter is
+    exercised against rows written here.
+    """
+    with Session(get_engine()) as session:
+        statement = select(Move).where(col(Move.ticker) == TICKER)
+        by_date = {row.date.isoformat(): row for row in session.exec(statement).all()}
+        for iso, sub_routing in assignments.items():
+            move = by_date[iso]
+            move.sub_routing = sub_routing
+            session.add(move)
+        session.commit()
 
 
 # --------------------------------------------------------------------------- #
@@ -400,3 +480,142 @@ def test_lower_case_ticker_is_upper_cased(client: TestClient) -> None:
     assert payload["ticker"] == TICKER
     assert payload["company"]["ticker"] == TICKER
     assert payload["moves"]
+
+
+# --------------------------------------------------------------------------- #
+# v1.5: the relations read, the sub-routing filter and the new counts
+# --------------------------------------------------------------------------- #
+
+
+def test_relations_returns_every_edge_in_a_stable_order(client: TestClient) -> None:
+    read_ticker(client)
+    seed_edges()
+
+    response = client.get(f"/tickers/{TICKER}/relations")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["ticker"] == TICKER
+    # Ordered by relation, then dst — the order `edges_of` promises.
+    assert [(edge["relation"], edge["dst"]) for edge in payload["edges"]] == [
+        ("competitor", "AMD"),
+        ("competitor", "INTC"),
+        ("country", "CN"),
+        ("country", "TW"),
+        ("customer", "MSFT"),
+        ("factor", "oil"),
+        ("supplier", "TSM"),
+    ]
+    amd = payload["edges"][0]
+    assert amd == {"dst": "AMD", "relation": "competitor", "weight": 0.8, "source": "model"}
+
+
+def test_relations_filter_keeps_one_relation(client: TestClient) -> None:
+    read_ticker(client)
+    seed_edges()
+
+    response = client.get(f"/tickers/{TICKER}/relations", params={"relation": "country"})
+
+    assert response.status_code == 200, response.text
+    edges = response.json()["edges"]
+    assert [edge["dst"] for edge in edges] == ["CN", "TW"]
+    assert {edge["relation"] for edge in edges} == {"country"}
+
+
+def test_relations_of_a_stored_ticker_with_no_edges_is_an_empty_list(
+    client: TestClient,
+) -> None:
+    """The keyless case, and it is a 200: the ticker is stored, and "no edges"
+    is the honest answer rather than a missing resource."""
+    read_ticker(client)
+
+    response = client.get(f"/tickers/{TICKER}/relations")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"ticker": TICKER, "edges": []}
+
+
+def test_relations_for_an_unknown_ticker_is_a_404(client: TestClient) -> None:
+    response = client.get("/tickers/NOPE/relations")
+
+    assert response.status_code == 404
+    assert "NOPE" in response.json()["detail"]
+
+
+def test_relations_accepts_a_lower_case_ticker(client: TestClient) -> None:
+    read_ticker(client)
+    seed_edges()
+
+    response = client.get(f"/tickers/{TICKER.lower()}/relations")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["ticker"] == TICKER
+
+
+def test_an_unknown_relation_is_rejected_rather_than_silently_empty(
+    client: TestClient,
+) -> None:
+    read_ticker(client)
+
+    response = client.get(f"/tickers/{TICKER}/relations", params={"relation": "rival"})
+
+    assert response.status_code == 422
+
+
+def test_sub_routing_filters_the_move_list(client: TestClient) -> None:
+    payload = read_ticker(client)
+    dates = [move["date"] for move in payload["moves"]]
+    assert len(dates) >= 3
+    taiwan, china, rivals = dates[0], dates[1], dates[2]
+    set_sub_routing({taiwan: "country:TW", china: "country:CN", rivals: "share_shift"})
+
+    exact = read_ticker(client, sub_routing="country:TW")
+    assert [move["date"] for move in exact["moves"]] == [taiwan]
+    assert exact["filters"]["sub_routing"] == "country:TW"
+
+    # The one prefix match: bare "country" takes both codes and nothing else.
+    both = read_ticker(client, sub_routing="country")
+    assert sorted(move["date"] for move in both["moves"]) == sorted([taiwan, china])
+
+    assert [move["date"] for move in read_ticker(client, sub_routing="share_shift")["moves"]] == [
+        rivals
+    ]
+    assert read_ticker(client, sub_routing="supply_chain")["moves"] == []
+
+
+def test_the_move_shape_is_a_superset_of_v1(client: TestClient) -> None:
+    payload = read_ticker(client)
+    move = move_on(payload, shock_date())
+
+    for key in V1_MOVE_KEYS:
+        assert key in move, key
+    for key in V15_MOVE_KEYS:
+        assert key in move, key
+    # Unset without a key, and null rather than absent.
+    assert move["sub_routing"] is None
+    assert move["macro_driver"] is None
+
+
+def test_the_single_move_read_carries_the_new_keys_too(client: TestClient) -> None:
+    read_ticker(client)
+
+    response = client.get(f"/tickers/{TICKER}/moves/{shock_date().isoformat()}")
+
+    assert response.status_code == 200, response.text
+    move = response.json()
+    for key in (*V1_MOVE_KEYS, *V15_MOVE_KEYS):
+        assert key in move, key
+
+
+def test_ingest_reports_the_new_counts(client: TestClient) -> None:
+    response = client.post(f"/tickers/{TICKER}/ingest", params={"top_n": 1})
+
+    assert response.status_code == 200, response.text
+    result = response.json()
+    # Present and integral; zero here because the keyless provider names no
+    # relations and the factor proxies have no synthetic prices.
+    assert result["n_edges"] == 0
+    assert result["n_geo_events"] == 0
+    # And every v1 count is still there.
+    for key in ("n_prices", "n_moves", "n_articles", "n_explanations"):
+        assert key in result

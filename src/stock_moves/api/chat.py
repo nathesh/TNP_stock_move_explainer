@@ -6,7 +6,7 @@ The route is thin on purpose. It owns three things and nothing else:
    session ticker over the read functions in `stock_moves.queries`, so a
    provider calls `list_moves(ticker="NVDA", limit=5)` and gets exactly the
    dicts the HTTP routes return — the model and the API client never see two
-   different shapes. The three names are the ones promised by
+   different shapes. The four names are the ones promised by
    `providers.base.TOOL_SPECS`.
 2. **The session.** A turn with no `session_id` mints one; the history is read
    back from `chat_messages`, so the tool-calling loop is stateless and the
@@ -39,7 +39,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends
 
-from stock_moves import narrate, timeframe
+from stock_moves import narrate, ontology, timeframe
 from stock_moves.api.deps import get_db, get_provider_dep
 from stock_moves.api.schemas import ChatRequest, ChatResponse, ToolCallOut, WindowOut
 from stock_moves.db import Session
@@ -266,6 +266,21 @@ def make_tools(
             get_company(session, ticker),
         )
 
+    def tool_get_relations(**kwargs: Any) -> dict[str, Any]:
+        """The company's stored edges (v1.5 decision 10).
+
+        Facts about the company, not about a day, so no window narrows them and
+        an empty list is a real answer rather than an error: with no key the
+        model relations are empty by design, and the ETF fallback for
+        `competitor` can come back empty as well. Saying "none are stored" is
+        the honest reply, and the tool description tells the model so.
+        """
+        ticker = _resolve_ticker(kwargs, default_ticker)
+        return {
+            "ticker": ticker,
+            "edges": ontology.edges_to_dicts(ontology.edges_of(session, ticker)),
+        }
+
     def tool_search_news(**kwargs: Any) -> list[dict[str, Any]]:
         """Headlines linked to the ticker's moves, most relevant first."""
         ticker = _resolve_ticker(kwargs, default_ticker)
@@ -283,6 +298,7 @@ def make_tools(
     return {
         "list_moves": tool_list_moves,
         "get_move": tool_get_move,
+        "get_relations": tool_get_relations,
         "search_news": tool_search_news,
     }
 

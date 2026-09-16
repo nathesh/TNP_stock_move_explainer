@@ -186,11 +186,20 @@ class RelationsProvider(HeuristicProvider):
     `HeuristicProvider.suggest_relations` returns all four relations empty by
     design (decision 3), so without this stub there are no competitor edges, no
     country edges, and the geo half of v1.5 is unreachable in a test.
+
+    `relation_calls` counts the answers handed out. A real run asks a model, so
+    the count is the run's model-call bill for edges: it must be 1 per ingest,
+    however many times the edges are written.
     """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.relation_calls = 0
 
     def suggest_relations(
         self, ticker: str, name: str, sector: str | None, industry: str | None
     ) -> Relations:
+        self.relation_calls += 1
         return Relations(
             competitors=RIVALS,
             suppliers=SUPPLIERS,
@@ -652,8 +661,8 @@ def test_no_factor_frame_skips_the_factor_pass_but_still_writes_edges(
     This is the keyless-and-offline shape of the run: `fetch_factor_returns`
     resolved nothing, so `build_features` is called the v1 way and every
     `macro_driver` is NULL. The model relations are still written — they never
-    depended on prices — which is what keeps the two `build_edges` calls
-    independently useful.
+    depended on prices — which is what keeps the first of the two `build_edges`
+    passes useful on its own when the second never happens.
     """
     result = ingest.ingest_ticker(
         session,
@@ -664,6 +673,8 @@ def test_no_factor_frame_skips_the_factor_pass_but_still_writes_edges(
         news_source=news,
     )
 
+    # One model call even though the factor pass never ran.
+    assert relations_provider.relation_calls == 1
     assert edges(session, "factor") == []
     assert {edge.dst for edge in edges(session, "competitor")} == set(RIVALS)
     assert {edge.dst for edge in edges(session, "supplier")} == set(SUPPLIERS)
@@ -684,6 +695,59 @@ def test_no_factor_frame_skips_the_factor_pass_but_still_writes_edges(
     assert result.n_geo_events == 0
     assert session.exec(select(GeoEvent)).all() == []
     assert not any("Taiwan" in query for query in news.queries)
+
+
+def test_one_relations_call_per_run_with_every_relation_written(
+    session: Session,
+    country_network: None,
+    news: FakeNewsSource,
+    relations_provider: RelationsProvider,
+) -> None:
+    """The edges are written twice and the model is asked once.
+
+    The `country` edges have to exist before the country ETFs can be chosen,
+    and the `factor` edges cannot exist until those returns are fitted, so
+    `build_edges` runs twice per ingest. It is handed one `Relations` for both
+    passes, so the run's model-call bill for edges is one — with the competitor,
+    country and factor edges all present at the end of it.
+    """
+    ingest.ingest_ticker(
+        session,
+        TICKER,
+        period=PERIOD,
+        top_n=TOP_N,
+        provider=relations_provider,
+        news_source=news,
+    )
+
+    assert relations_provider.relation_calls == 1
+    assert {edge.dst for edge in edges(session, "competitor")} == set(RIVALS)
+    assert {edge.dst for edge in edges(session, "supplier")} == set(SUPPLIERS)
+    assert {edge.dst for edge in edges(session, "customer")} == set(CUSTOMERS)
+    assert [edge.dst for edge in edges(session, "country")] == [COUNTRY]
+    assert {edge.dst for edge in edges(session, "factor")} == set(prices.FACTOR_ETFS) | {
+        COUNTRY_FACTOR
+    }
+
+
+def test_second_run_asks_the_model_once_more_and_duplicates_no_edges(
+    session: Session,
+    country_network: None,
+    news: FakeNewsSource,
+    relations_provider: RelationsProvider,
+) -> None:
+    """Two ingests, two calls — one each — and the same rows, not twice as many."""
+    ingest.ingest_ticker(
+        session, TICKER, period=PERIOD, top_n=TOP_N, provider=relations_provider, news_source=news
+    )
+    n_edges = len(edges(session))
+
+    ingest.ingest_ticker(
+        session, TICKER, period=PERIOD, top_n=TOP_N, provider=relations_provider, news_source=news
+    )
+
+    assert relations_provider.relation_calls == 2
+    assert len(edges(session)) == n_edges
 
 
 def test_country_run_stores_factor_columns_sub_routing_and_geo_events(

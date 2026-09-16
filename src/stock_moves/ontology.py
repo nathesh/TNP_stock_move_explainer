@@ -16,7 +16,9 @@ v1.5 adds the typed-fact layer on top of that row: `build_edges` turns one
 rows, and `edges_of` / `relation_tickers` / `country_codes` / `edges_to_dicts`
 are the reads over them. `competitor` replaces the idea of a peer (v1.5
 decision 2): `companies.peers_json` stays as the keyless ETF fallback and is
-where `build_edges` gets competitors when the model names none.
+where `build_edges` gets competitors when the model names none. The model call
+itself is `fetch_relations`, split out so an ingest that builds twice — country
+edges before prices, factor edges after — still pays for it once.
 
 `prices` is imported as a module and called as `prices.fetch_info(...)` so a
 test monkeypatches one name and this layer never touches the network.
@@ -47,6 +49,7 @@ __all__ = [
     "country_codes",
     "edges_of",
     "edges_to_dicts",
+    "fetch_relations",
     "get_or_build_company",
     "peers_of",
     "relation_tickers",
@@ -172,12 +175,19 @@ def peers_of(company: Company) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 
-def _relations(provider: ModelProvider, company: Company) -> Relations:
-    """One `suggest_relations` call; all-empty on any provider failure.
+def fetch_relations(company: Company, provider: ModelProvider) -> Relations:
+    """One `suggest_relations` call for a company; all-empty on any failure.
 
     Same contract as `_provider_peers`: a broken or rate-limited model degrades
     to the keyless behaviour — competitors from the ETF fallback and no other
     edges — rather than failing the build.
+
+    It is public because the model's answer is worth exactly one call per run
+    and `build_edges` may be called twice within one (first for the `country`
+    edges that choose the country ETFs, again once the betas those returns
+    yield are in hand). A caller that fetches once and hands the same
+    `Relations` to both calls pays for one model call, not two; `build_edges`
+    calls this itself only when it is given nothing.
     """
     try:
         return provider.suggest_relations(
@@ -234,6 +244,8 @@ def build_edges(
     company: Company,
     provider: ModelProvider,
     factor_betas: Mapping[str, float] | None = None,
+    *,
+    relations: Relations | None = None,
 ) -> list[CompanyEdge]:
     """Build and store the company's `company_edges` rows, and return them.
 
@@ -252,11 +264,18 @@ def build_edges(
     means "prices had nothing to say this time" and leaves fitted betas alone,
     while an empty mapping means "no factors" and clears them.
 
+    `relations` is the already-fetched answer: hand one in and `provider` is
+    never called, which is how a run that builds twice — once before prices for
+    the `country` edges, once after for the `factor` ones — still costs exactly
+    one model call (`fetch_relations` is that call). Left `None`, this fetches
+    its own, so a single-call caller need not know the parameter exists.
+
     Commits, like `upsert_company`: this is a cache-filling write the caller
     should not have to remember to flush.
     """
     src = company.ticker.strip().upper()
-    relations = _relations(provider, company)
+    if relations is None:
+        relations = fetch_relations(company, provider)
 
     competitors = _clean_tickers(relations.competitors, exclude=src)
     competitor_source = EDGE_SOURCE_MODEL
