@@ -12,11 +12,11 @@ must not be read as one.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 
 import pytest
 
-from stock_moves.timeframe import Window, resolve
+from stock_moves.timeframe import Window, market_today, resolve
 
 #: A Tuesday, so the Mon-Sun week boundaries are visible rather than aligned.
 TODAY = date(2026, 9, 15)
@@ -145,3 +145,48 @@ def test_a_different_today_moves_the_window() -> None:
     """No hidden clock: the same text against another day is another window."""
     resolved = resolve("this year", date(2025, 3, 2))
     assert resolved == Window(date(2025, 1, 1), date(2025, 3, 2), "this year")
+
+
+# --------------------------------------------------------------------------- #
+# The clock
+# --------------------------------------------------------------------------- #
+#
+# `market_today` is the one place the module reads a real clock, and the bug it
+# fixes is invisible in any zone but the server's: on Vercel the process runs
+# in UTC, so from 8pm Eastern onward `date.today()` was already tomorrow and
+# every window came back a day ahead of the trading calendar. Each case below
+# is an instant, passed in, so the assertion is about the conversion and not
+# about when the suite happens to run.
+
+
+def test_market_today_is_yesterday_in_new_york_late_in_the_utc_day() -> None:
+    """00:55 UTC on the 16th is 20:55 on the 15th in New York. The bug, exactly."""
+    now = datetime(2026, 9, 16, 0, 55, tzinfo=UTC)
+    assert market_today(now) == date(2026, 9, 15)
+
+
+def test_market_today_catches_up_once_new_york_reaches_the_same_day() -> None:
+    """05:00 UTC is 01:00 EDT (UTC-4 in September): both calendars agree again."""
+    now = datetime(2026, 9, 16, 5, 0, tzinfo=UTC)
+    assert market_today(now) == date(2026, 9, 16)
+
+
+def test_market_today_uses_the_winter_offset_in_january() -> None:
+    """EST is UTC-5, so 04:30 UTC on the 16th is still 23:30 on the 15th."""
+    now = datetime(2026, 1, 16, 4, 30, tzinfo=UTC)
+    assert market_today(now) == date(2026, 1, 15)
+
+
+def test_market_today_reads_the_real_clock_when_given_nothing() -> None:
+    """The production call, bracketed rather than pinned so it cannot flake."""
+    before = datetime.now(UTC)
+    today = market_today()
+    after = datetime.now(UTC)
+    assert market_today(before) <= today <= market_today(after)
+
+
+def test_market_today_refuses_a_naive_datetime() -> None:
+    """A wall clock with no zone is the ambiguity this function exists to end."""
+    with pytest.raises(ValueError, match="timezone-aware"):
+        naive = datetime(2026, 9, 16, 0, 55)  # noqa: DTZ001 - the point of the test
+        market_today(naive)

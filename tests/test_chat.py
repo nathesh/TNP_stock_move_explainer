@@ -590,3 +590,22 @@ def test_get_move_still_takes_a_date_the_user_wrote_out() -> None:
     """The one date the model may pass, because it is quoting the question."""
     spec = next(tool for tool in TOOL_SPECS if tool["name"] == "get_move")
     assert spec["input_schema"]["required"] == ["date"]
+
+
+# --------------------------------------------------------------------------- #
+# The one date the model may pass
+# --------------------------------------------------------------------------- #
+
+
+def test_get_move_refuses_a_relative_day(session: Session) -> None:
+    """Seen live: the model called `get_move` with `date="yesterday"`.
+
+    `get_move` takes the one date a user wrote out in full; a relative day is
+    the server's job and reaches `list_moves` as a resolved window instead. So
+    the argument has to fail loudly — `ValueError` out of the tool, which the
+    provider turns into a message — rather than be guessed at here, which would
+    put a second clock in the codebase and defeat the point of the first.
+    """
+    tools = chat_route.make_tools(session, TICKER)
+    with pytest.raises(ValueError):
+        tools["get_move"](date="yesterday")

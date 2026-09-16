@@ -22,11 +22,12 @@ that into a message to the user rather than a 500.
 
 Two arguments are not merely coerced but ignored outright. A model has no
 clock, so the time window a question implies is resolved here by
-`timeframe.resolve` against the server's real date and pushed into the tool
-bindings; a `start` or `end` that arrives from the model anyway is dropped —
-always, not only when the server resolved a window of its own — and dropped
-from the recorded transcript too, so "show its work" never displays a date the
-query did not use. `timeframe` says why at length.
+`timeframe.resolve` against the exchange's real date -- New York's, not the
+server's, which on Vercel is UTC -- and pushed into the tool bindings; a
+`start` or `end` that arrives from the model anyway is dropped — always, not
+only when the server resolved a window of its own — and dropped from the
+recorded transcript too, so "show its work" never displays a date the query
+did not use. `timeframe` says why at length.
 """
 
 from __future__ import annotations
@@ -56,16 +57,19 @@ from stock_moves.queries import (
     save_chat_message,
     search_news,
 )
-from stock_moves.timeframe import Window
+from stock_moves.timeframe import Window, market_today
 
 __all__ = ["make_tools", "router"]
 
 router = APIRouter(tags=["chat"])
 
-#: Today, as a function so a test can freeze it. The route must not read the
-#: clock through anything else: a resolved window is only checkable if the
-#: date it was resolved against is.
-_today: Callable[[], date] = date.today
+#: Today *on the exchange's calendar*, as a function so a test can freeze it.
+#: The route must not read the clock through anything else: a resolved window
+#: is only checkable if the date it was resolved against is. `date.today` was
+#: wrong here -- it is the server's date, and the server runs in UTC, which put
+#: every window a day ahead of New York from 8pm Eastern onward.
+#: `timeframe.market_today` says why the exchange's zone is the right one.
+_today: Callable[[], date] = market_today
 
 SessionDep = Annotated[Session, Depends(get_db)]
 ProviderDep = Annotated[ModelProvider, Depends(get_provider_dep)]

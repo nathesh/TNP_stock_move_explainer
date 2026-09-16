@@ -16,10 +16,12 @@ the tool binding; `providers/base.py` no longer shows the model a `start` or an
 and that goes to `get_move`, not through this module.
 
 Like `narrate.py` this is deliberately dependency-free -- no database, no
-settings, no provider imports -- and deliberately has no clock of its own:
-`resolve(text, today)` is a pure function, which is the only reason a window
-can be tested at all. `None` is the ordinary answer. Most questions name no
-period, and a one-year dataset does not need one.
+settings, no provider imports -- and `resolve(text, today)` is still a pure
+function of the `today` it is handed, which is the only reason a window can be
+tested at all. The one clock here is `market_today`, kept beside the resolver
+because *which* clock counts is part of the same rule: the date is the
+exchange's, not the server's. `None` is the ordinary answer. Most questions
+name no period, and a one-year dataset does not need one.
 """
 
 from __future__ import annotations
@@ -28,9 +30,37 @@ import re
 from calendar import monthrange
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
-__all__ = ["Window", "resolve"]
+__all__ = ["MARKET_TZ", "Window", "market_today", "resolve"]
+
+
+#: The exchange's clock, not the server's.
+#:
+#: The data is US equities, so "today" and "yesterday" are questions about a
+#: *trading* day on the New York calendar. The process may run anywhere -- on
+#: Vercel it runs in UTC, where after 5pm Pacific / 8pm Eastern every window is
+#: already a day ahead of the market: "this year" ended on a date the exchange
+#: had not reached, and "yesterday" resolved to what was still today in New
+#: York. The server's location is an accident of deployment; the exchange's
+#: date is what the question is about.
+#:
+#: `zoneinfo` is stdlib, so this keeps the module dependency-free.
+MARKET_TZ = ZoneInfo("America/New_York")
+
+
+def market_today(now: datetime | None = None) -> date:
+    """The exchange's current date: `now` in `MARKET_TZ`, defaulting to the real clock.
+
+    `now` must be timezone-aware. A naive datetime is rejected rather than
+    assumed to be anything: assuming a zone is exactly the bug this function
+    exists to fix, and a caller holding a wall clock knows which zone it is in.
+    """
+    current = datetime.now(UTC) if now is None else now
+    if current.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    return current.astimezone(MARKET_TZ).date()
 
 
 @dataclass(frozen=True)

@@ -180,8 +180,9 @@ curl -s http://127.0.0.1:8000/ | head -5
 ```
 
 A relative phrase in a chat question — "yesterday", "last week", "this year" —
-is resolved on the server from the real clock and echoed back in the response's
-`window`; the model is never shown a date field and never asked for a date.
+is resolved on the server from the exchange's clock (America/New_York, not the
+server's zone) and echoed back in the response's `window`; the model is never
+shown a date field and never asked for a date.
 
 `GET /tickers/{ticker}` also takes `start`, `end`, `pct_threshold`,
 `category`, `min_relevance`, `include_prices` and `refresh`.
