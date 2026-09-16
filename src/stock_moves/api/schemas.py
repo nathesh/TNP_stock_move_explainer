@@ -38,6 +38,7 @@ __all__ = [
     "PriceOut",
     "TickerResponse",
     "ToolCallOut",
+    "WindowOut",
 ]
 
 # `date` is a field name on `PriceOut` and `MoveOut`, which shadows the
@@ -187,9 +188,29 @@ class ToolCallOut(_Schema):
     output: Any = None
 
 
+class WindowOut(_Schema):
+    """The time window the server resolved from the question, or absent.
+
+    `phrase` is the wording it was read from ("this year", "last week"), so a
+    client can say which period it answered for. The model is never asked for
+    a date and never sees this; `stock_moves.timeframe` says why.
+    """
+
+    phrase: str
+    start: DateT
+    end: DateT
+
+    @classmethod
+    def from_window(cls, window: Any) -> WindowOut:
+        """Build from a `timeframe.Window` without importing it here."""
+        return cls(phrase=window.phrase, start=window.start, end=window.end)
+
+
 class ChatResponse(_Schema):
     """`POST /chat`. Plain JSON, no SSE (DESIGN section 6)."""
 
     reply: str
     session_id: str
     tool_calls: list[ToolCallOut] = Field(default_factory=list)
+    #: `null` when the question named no period, which is the usual case.
+    window: WindowOut | None = None

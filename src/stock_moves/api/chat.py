@@ -19,19 +19,28 @@ Tool arguments arrive from a language model, so every accessor is defensive:
 each tool takes `**kwargs`, ignores what it does not know, coerces the types it
 does, and lets a genuinely bad argument raise `ValueError` — the provider turns
 that into a message to the user rather than a 500.
+
+Two arguments are not merely coerced but ignored outright. A model has no
+clock, so the time window a question implies is resolved here by
+`timeframe.resolve` against the server's real date and pushed into the tool
+bindings; a `start` or `end` that arrives from the model anyway is dropped —
+always, not only when the server resolved a window of its own — and dropped
+from the recorded transcript too, so "show its work" never displays a date the
+query did not use. `timeframe` says why at length.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import date, datetime
 from typing import Annotated, Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends
 
-from stock_moves import narrate
+from stock_moves import narrate, timeframe
 from stock_moves.api.deps import get_db, get_provider_dep
-from stock_moves.api.schemas import ChatRequest, ChatResponse, ToolCallOut
+from stock_moves.api.schemas import ChatRequest, ChatResponse, ToolCallOut, WindowOut
 from stock_moves.db import Session
 from stock_moves.providers import ChatTurn, ModelProvider, ToolFn
 from stock_moves.queries import (
@@ -47,10 +56,16 @@ from stock_moves.queries import (
     save_chat_message,
     search_news,
 )
+from stock_moves.timeframe import Window
 
 __all__ = ["make_tools", "router"]
 
 router = APIRouter(tags=["chat"])
+
+#: Today, as a function so a test can freeze it. The route must not read the
+#: clock through anything else: a resolved window is only checkable if the
+#: date it was resolved against is.
+_today: Callable[[], date] = date.today
 
 SessionDep = Annotated[Session, Depends(get_db)]
 ProviderDep = Annotated[ModelProvider, Depends(get_provider_dep)]
@@ -69,6 +84,11 @@ _ARTICLES_LIMIT = 10
 #: readable block; the full set is one `get_move` away.
 _LIST_ARTICLES = 3
 _NEWS_LIMIT = 20
+
+#: The tools whose results a time window narrows. `get_move` is not one of
+#: them: its `date` is a day the user wrote out in full, and a window would
+#: only contradict it.
+_WINDOWED_TOOLS = frozenset({"list_moves", "search_news"})
 
 
 # --------------------------------------------------------------------------- #
@@ -160,13 +180,29 @@ def _as_text(value: Any) -> str | None:
 # --------------------------------------------------------------------------- #
 
 
-def make_tools(session: Session, default_ticker: str | None) -> dict[str, ToolFn]:
-    """The `TOOL_SPECS` tools, bound to this request's session and ticker.
+def make_tools(
+    session: Session,
+    default_ticker: str | None,
+    window: Window | None = None,
+) -> dict[str, ToolFn]:
+    """The `TOOL_SPECS` tools, bound to this request's session, ticker and window.
 
     Every value returned is JSON-serialisable, because it is the same dict the
     HTTP routes return and it is also echoed back to the client in
     `tool_calls[].output`.
+
+    `window` is the *only* way a date reaches these two queries. A `start` or
+    `end` in the call is ignored unconditionally — not preferred against, not
+    fallen back to: ignored. That is the whole fix, and it is deliberately not
+    a precedence rule, because a precedence rule still lets a model's guess
+    through whenever the server resolved nothing. No phrase in the question
+    means no window, and no window means the whole dataset. The caller resolved
+    the window from the real clock; the model only ever guessed.
     """
+
+    def _bounds() -> tuple[date | None, date | None]:
+        """The window's bounds, or no bounds at all. Never the call's own."""
+        return (None, None) if window is None else (window.start, window.end)
 
     def tool_list_moves(**kwargs: Any) -> list[dict[str, Any]]:
         """Biggest moves for the ticker, with each cached explanation.
@@ -176,9 +212,10 @@ def make_tools(session: Session, default_ticker: str | None) -> dict[str, ToolFn
         thresholds here would hide moves the ingest flagged.
         """
         ticker = _resolve_ticker(kwargs, default_ticker)
+        start, end = _bounds()
         filters = MoveFilters(
-            start=_as_date(kwargs.get("start")),
-            end=_as_date(kwargs.get("end")),
+            start=start,
+            end=end,
             z_threshold=0.0,
             pct_threshold=0.0,
             direction=_as_direction(kwargs.get("direction")),
@@ -228,12 +265,13 @@ def make_tools(session: Session, default_ticker: str | None) -> dict[str, ToolFn
     def tool_search_news(**kwargs: Any) -> list[dict[str, Any]]:
         """Headlines linked to the ticker's moves, most relevant first."""
         ticker = _resolve_ticker(kwargs, default_ticker)
+        start, end = _bounds()
         rows = search_news(
             session,
             ticker,
             query=_as_text(kwargs.get("query")),
-            start=_as_date(kwargs.get("start")),
-            end=_as_date(kwargs.get("end")),
+            start=start,
+            end=end,
             limit=_as_limit(kwargs.get("limit"), _NEWS_LIMIT),
         )
         return [article_to_dict(article, link) for article, link in rows]
@@ -276,10 +314,17 @@ def chat(
     """Answer one chat turn against the stored moves, news and explanations.
 
     The provider sees the trimmed transcript plus this turn, and the tools
-    bound to `req.ticker`; both turns are persisted, the assistant's with the
-    tool calls it made so the UI can show its work.
+    bound to `req.ticker` and to the window this turn's question implies; both
+    turns are persisted, the assistant's with the tool calls it made so the UI
+    can show its work.
+
+    The window is resolved from `req.message` only. A phrase in an earlier turn
+    is not carried forward: "and last week?" is a follow-up a future version
+    should handle by re-resolving against the rewritten question, not by
+    leaving a stale window bound to the tools.
     """
     session_id = req.session_id or uuid4().hex
+    window = timeframe.resolve(req.message, _today())
 
     history = [
         ChatTurn(role=message.role, content=message.content)
@@ -289,9 +334,14 @@ def chat(
     history.append(ChatTurn(role="user", content=req.message))
     save_chat_message(session, session_id, "user", req.message)
 
-    reply = provider.chat(history, make_tools(session, req.ticker), req.ticker)
+    reply = provider.chat(history, make_tools(session, req.ticker, window), req.ticker)
     tool_calls = [
-        {"name": call.name, "input": call.input, "output": call.output} for call in reply.tool_calls
+        {
+            "name": call.name,
+            "input": _recorded_input(call.name, call.input, window),
+            "output": call.output,
+        }
+        for call in reply.tool_calls
     ]
     save_chat_message(session, session_id, "assistant", reply.reply, tool_calls)
 
@@ -299,4 +349,27 @@ def chat(
         reply=reply.reply,
         session_id=session_id,
         tool_calls=[ToolCallOut(**call) for call in tool_calls],
+        window=None if window is None else WindowOut.from_window(window),
     )
+
+
+def _recorded_input(name: str, sent: dict[str, Any], window: Window | None) -> dict[str, Any]:
+    """The tool's arguments as the transcript should show them.
+
+    Not as the model sent them: the point of the panel is to let a reader check
+    the answer, so it has to show the window the query actually ran with. For a
+    dated tool that means the server's `start`/`end` plus the phrase they came
+    from, and with no window it means no dates at all rather than a pair the
+    model invented.
+    """
+    recorded = dict(sent)
+    if name not in _WINDOWED_TOOLS:
+        return recorded
+    if window is None:
+        recorded.pop("start", None)
+        recorded.pop("end", None)
+        return recorded
+    recorded["start"] = window.start.isoformat()
+    recorded["end"] = window.end.isoformat()
+    recorded["window"] = window.phrase
+    return recorded

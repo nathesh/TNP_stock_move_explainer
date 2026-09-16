@@ -261,7 +261,8 @@ TOOL_SPECS: list[dict[str, Any]] = [
         "name": "list_moves",
         "description": (
             "The ticker's notable daily moves, ranked by `order`, with the "
-            "cached explanation summary when one exists. " + _MOVE_SHAPE
+            "cached explanation summary when one exists. Any time window in "
+            "the question is applied by the server; do not pass dates. " + _MOVE_SHAPE
         ),
         "input_schema": {
             "type": "object",
@@ -269,14 +270,6 @@ TOOL_SPECS: list[dict[str, Any]] = [
                 "ticker": {
                     "type": "string",
                     "description": "Defaults to the session ticker.",
-                },
-                "start": {
-                    "type": "string",
-                    "description": "Inclusive start date, YYYY-MM-DD.",
-                },
-                "end": {
-                    "type": "string",
-                    "description": "Inclusive end date, YYYY-MM-DD.",
                 },
                 "direction": {
                     "type": "string",
@@ -331,7 +324,8 @@ TOOL_SPECS: list[dict[str, Any]] = [
         "name": "search_news",
         "description": (
             "Headlines linked to a ticker's moves, filtered by a substring of "
-            "the title. " + _ARTICLE_SHAPE
+            "the title. Any time window in the question is applied by the "
+            "server; do not pass dates. " + _ARTICLE_SHAPE
         ),
         "input_schema": {
             "type": "object",
@@ -343,14 +337,6 @@ TOOL_SPECS: list[dict[str, Any]] = [
                 "query": {
                     "type": "string",
                     "description": "Case-insensitive substring of the headline.",
-                },
-                "start": {
-                    "type": "string",
-                    "description": "Inclusive start date, YYYY-MM-DD.",
-                },
-                "end": {
-                    "type": "string",
-                    "description": "Inclusive end date, YYYY-MM-DD.",
                 },
                 "limit": {
                     "type": "integer",

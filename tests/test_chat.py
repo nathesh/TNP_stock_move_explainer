@@ -13,13 +13,15 @@ how the tool bindings get exercised through the real dependency graph.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from datetime import UTC, date, datetime
+from collections.abc import Iterator, Mapping, Sequence
+from datetime import UTC, date, datetime, timedelta
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import col, func, select
 
+from stock_moves.api import chat as chat_route
 from stock_moves.api import deps
 from stock_moves.api.app import create_app
 from stock_moves.db import Session, configure_engine, get_engine, init_db
@@ -31,10 +33,23 @@ from stock_moves.models import (
     Move,
     MoveArticle,
 )
+from stock_moves.providers import TOOL_SPECS, ChatReply, ChatTurn, ToolCallRecord, ToolFn
 
 TICKER = "TEST"
 MOVE_DATE = date(2025, 6, 3)
 SUMMARY = "Guidance cut."
+
+#: The date the server is pretending it is, for every fixture whose questions
+#: name a period. Fixed, because a window resolved against `date.today()` is
+#: not a thing a test can assert — and because a suite that reads the real
+#: clock passes until the year turns over and then fails for no reason.
+FROZEN_TODAY = date(2026, 9, 15)
+
+
+@pytest.fixture
+def frozen_today(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the route's clock. Nothing else in the app reads a date."""
+    monkeypatch.setattr(chat_route, "_today", lambda: FROZEN_TODAY)
 
 
 @pytest.fixture
@@ -243,8 +258,14 @@ def _seed_two_falls(session: Session) -> None:
 
 
 @pytest.fixture
-def ranking_client(no_api_key: None) -> Iterator[TestClient]:
-    """The `client` fixture's wiring, seeded with the disagreeing pair."""
+def ranking_client(no_api_key: None, frozen_today: None) -> Iterator[TestClient]:
+    """The `client` fixture's wiring, seeded with the disagreeing pair.
+
+    The clock is pinned because one of these questions says "this year": with
+    the real `date.today()` the window would stop containing the 2026 moves
+    the moment the year turned, and a passing test would start failing on a
+    date rather than on a change.
+    """
     engine = configure_engine("sqlite://")
     init_db(engine)
     with Session(engine) as seed_session:
@@ -323,3 +344,249 @@ def test_a_plain_question_is_still_ranked_by_how_unusual_the_day_was(
     ]
     # And the header says which ranking it is, rather than claiming "biggest".
     assert "the two most unusual falls in the data" in body["reply"]
+
+
+# --------------------------------------------------------------------------- #
+# Time windows: the model does not get a clock
+# --------------------------------------------------------------------------- #
+
+#: What the real model did, reproduced exactly: it has no clock, so it filled
+#: `start` and `end` in from its training data and clipped the window shut.
+MODEL_START = "2024-01-01"
+MODEL_END = "2024-06-07"
+
+
+class DateInventingProvider:
+    """A provider that always passes the dates the OpenAI loop used to pass.
+
+    It is the defect in a class: every `list_moves` call carries a 2024 window
+    that no stored move falls inside. If the server's window did not win, the
+    answers below would all be empty.
+    """
+
+    name = "date-inventing"
+
+    def __init__(self) -> None:
+        self.sent: list[dict[str, Any]] = []
+
+    def chat(
+        self,
+        history: Sequence[ChatTurn],
+        tools: Mapping[str, ToolFn],
+        ticker: str | None,
+    ) -> ChatReply:
+        payload: dict[str, Any] = {
+            "ticker": ticker,
+            "order": "pct",
+            "limit": 5,
+            "start": MODEL_START,
+            "end": MODEL_END,
+        }
+        self.sent.append(dict(payload))
+        output = tools["list_moves"](**payload)
+        return ChatReply(f"{len(output)} moves.", [ToolCallRecord("list_moves", payload, output)])
+
+    def score_articles(self, move: Any, articles: Any) -> list[Any]:  # pragma: no cover
+        return []
+
+    def explain(self, move: Any, scored: Any) -> Any:  # pragma: no cover
+        raise NotImplementedError
+
+    def suggest_peers(self, *args: Any, **kwargs: Any) -> list[str]:  # pragma: no cover
+        return []
+
+
+def _frozen_client(seed: Any, provider: Any | None) -> Iterator[TestClient]:
+    """The `client` wiring with the clock pinned and, optionally, a fake model."""
+    engine = configure_engine("sqlite://")
+    init_db(engine)
+    with Session(engine) as seed_session:
+        seed(seed_session)
+
+    deps.reset_provider_cache()
+    app = create_app()
+    if provider is not None:
+        app.dependency_overrides[deps.get_provider_dep] = lambda: provider
+    with TestClient(app) as test_client:
+        yield test_client
+    app.dependency_overrides.clear()
+    deps.reset_provider_cache()
+    engine.dispose()
+
+
+@pytest.fixture
+def model_provider() -> DateInventingProvider:
+    return DateInventingProvider()
+
+
+@pytest.fixture
+def dated_client(
+    no_api_key: None,
+    frozen_today: None,
+    model_provider: DateInventingProvider,
+) -> Iterator[TestClient]:
+    """The disagreeing pair of falls, answered by the date-inventing provider."""
+    yield from _frozen_client(_seed_two_falls, model_provider)
+
+
+def test_the_models_invented_dates_do_not_reach_the_query(
+    dated_client: TestClient,
+    model_provider: DateInventingProvider,
+) -> None:
+    """The defect, end to end.
+
+    The provider sends a 2024 window that contains neither stored move. The
+    2026 answer still comes back, led by the largest fall — which is the whole
+    point: the server resolved "this year" and the model's guess was dropped.
+    """
+    response = dated_client.post(
+        "/chat", json={"message": "Why did TEST drop the most this year?", "ticker": TICKER}
+    )
+    assert response.status_code == 200
+
+    call = response.json()["tool_calls"][0]
+    assert [move["date"] for move in call["output"]] == [
+        LARGEST_DAY.isoformat(),
+        UNUSUAL_DAY.isoformat(),
+    ]
+    # The model really did send its own dates; they were simply ignored.
+    assert model_provider.sent[0]["start"] == MODEL_START
+
+
+def test_the_transcript_shows_the_window_the_server_used(
+    dated_client: TestClient,
+) -> None:
+    """ "Show its work" has to show the real query, not the model's request."""
+    response = dated_client.post(
+        "/chat", json={"message": "Why did TEST drop the most this year?", "ticker": TICKER}
+    )
+    recorded = response.json()["tool_calls"][0]["input"]
+    assert recorded["start"] == "2026-01-01"
+    assert recorded["end"] == FROZEN_TODAY.isoformat()
+    assert recorded["window"] == "this year"
+
+
+def test_the_response_reports_the_resolved_window(dated_client: TestClient) -> None:
+    response = dated_client.post(
+        "/chat", json={"message": "Why did TEST drop the most this year?", "ticker": TICKER}
+    )
+    assert response.json()["window"] == {
+        "phrase": "this year",
+        "start": "2026-01-01",
+        "end": FROZEN_TODAY.isoformat(),
+    }
+
+
+def test_a_question_with_no_phrase_records_no_dates_at_all(
+    dated_client: TestClient,
+) -> None:
+    """No window means no window: the whole dataset, and no dates shown.
+
+    The question names no period, so the server resolves nothing — and the
+    model's 2024 pair is still ignored rather than falling through as a
+    default. That is the difference between "the server's window wins" and
+    "the model never computes a date": only the second one survives a question
+    the server has no window for. Both 2026 moves come back.
+    """
+    response = dated_client.post(
+        "/chat", json={"message": "what were TEST's biggest falls?", "ticker": TICKER}
+    )
+    body = response.json()
+    assert body["window"] is None
+    assert [move["date"] for move in body["tool_calls"][0]["output"]] == [
+        LARGEST_DAY.isoformat(),
+        UNUSUAL_DAY.isoformat(),
+    ]
+
+    recorded = body["tool_calls"][0]["input"]
+    assert "start" not in recorded
+    assert "end" not in recorded
+    assert "window" not in recorded
+    # The arguments the model *could* legitimately send are untouched.
+    assert recorded["order"] == "pct"
+    assert recorded["ticker"] == TICKER
+
+
+# --------------------------------------------------------------------------- #
+# The same guarantee through the keyless path
+# --------------------------------------------------------------------------- #
+
+YESTERDAY = FROZEN_TODAY - timedelta(days=1)
+A_MONTH_AGO = FROZEN_TODAY - timedelta(days=30)
+
+
+def _seed_two_recent_falls(session: Session) -> None:
+    """One company and two down days, one of them yesterday."""
+    session.add(
+        Company(
+            ticker=TICKER,
+            name="Testco Industries",
+            sector="Technology",
+            industry="Semiconductors",
+            sector_etf="XLK",
+        )
+    )
+    for day, ret in ((YESTERDAY, -0.031), (A_MONTH_AGO, -0.062)):
+        session.add(
+            Move(
+                ticker=TICKER,
+                date=day,
+                ret=ret,
+                ret_z=-3.0,
+                mkt_component=-0.005,
+                sector_component=-0.005,
+                idio_component=ret + 0.01,
+                routing="company",
+                direction="down",
+            )
+        )
+    session.commit()
+
+
+@pytest.fixture
+def recent_client(no_api_key: None, frozen_today: None) -> Iterator[TestClient]:
+    """The recent pair, answered by `HeuristicProvider` as a keyless install is."""
+    yield from _frozen_client(_seed_two_recent_falls, None)
+
+
+def test_yesterday_narrows_the_heuristics_list_to_one_day(
+    recent_client: TestClient,
+) -> None:
+    """The heuristic sends no dates at all; the binding supplies them.
+
+    Its `_DATE_RE` only matches a written-out `YYYY-MM-DD`, so "yesterday"
+    routes to `list_moves` — and the server's one-day window is what makes the
+    answer about yesterday rather than about the larger fall a month earlier.
+    """
+    response = recent_client.post(
+        "/chat", json={"message": "why did TEST drop yesterday?", "ticker": TICKER}
+    )
+    assert response.status_code == 200
+
+    call = response.json()["tool_calls"][0]
+    assert call["name"] == "list_moves"
+    assert [move["date"] for move in call["output"]] == [YESTERDAY.isoformat()]
+    assert call["input"]["start"] == YESTERDAY.isoformat()
+    assert call["input"]["end"] == YESTERDAY.isoformat()
+    assert call["input"]["window"] == "yesterday"
+
+
+# --------------------------------------------------------------------------- #
+# The schema the model is shown
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("name", ["list_moves", "search_news"])
+def test_the_dated_tools_no_longer_offer_the_model_a_date(name: str) -> None:
+    """A date it cannot pass is a date it cannot invent."""
+    spec = next(tool for tool in TOOL_SPECS if tool["name"] == name)
+    properties = spec["input_schema"]["properties"]
+    assert "start" not in properties
+    assert "end" not in properties
+    assert "do not pass dates" in spec["description"]
+
+
+def test_get_move_still_takes_a_date_the_user_wrote_out() -> None:
+    """The one date the model may pass, because it is quoting the question."""
+    spec = next(tool for tool in TOOL_SPECS if tool["name"] == "get_move")
+    assert spec["input_schema"]["required"] == ["date"]

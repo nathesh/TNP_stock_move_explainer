@@ -131,6 +131,10 @@ PEERS_SYSTEM = (
 CHAT_SYSTEM = (
     "You explain stock moves using only the tools' results. Cite the date of "
     "every move you discuss. If the tools return nothing, say so.\n\n"
+    "You do not know today's date and must never guess or compute one. If the "
+    "question names no exact YYYY-MM-DD date, call list_moves -- the server "
+    "applies any time window the question implies. Only call get_move with a "
+    "date the user wrote out.\n\n"
     "Answer the question that was asked before adding detail: if someone asks "
     "which day was worst, the first sentence names that day and what happened, "
     "and the supporting numbers come after. When you describe several moves, "

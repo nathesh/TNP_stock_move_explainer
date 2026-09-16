@@ -149,14 +149,15 @@ tasks:
              "rate hike", "inflation", "cpi", "ppi", "jobs report", "payrolls", "unemployment", "tariff",
              "treasury", "yields", "recession", "gdp", "oil price", "crude", "dollar", "geopolit", "stimulus")
          TOOL_SPECS: list[dict[str, Any]]   # Anthropic tool format: {"name", "description", "input_schema"}
-           list_moves: {ticker: string (optional, defaults to the session ticker), start: string YYYY-MM-DD opt,
-                        end: string opt, direction: "up"|"down" opt, limit: integer opt default 10}
+           list_moves: {ticker: string (optional, defaults to the session ticker),
+                        direction: "up"|"down" opt, limit: integer opt default 10}
+             # No start/end: the model has no clock, so timeframe.resolve() applies the window server-side.
              description: "The ticker's notable daily moves, ranked by `order` (z: most unusual for the stock; pct: largest percentage), with the cached
                            explanation summary when one exists."
            get_move: {ticker: string opt, date: string YYYY-MM-DD required}
              description: "One move with its decomposition, linked articles and explanation."
-           search_news: {ticker: string opt, query: string opt, start: string opt, end: string opt,
-                         limit: integer opt default 20}
+           search_news: {ticker: string opt, query: string opt, limit: integer opt default 20}
+             # No start/end, for the same reason as list_moves.
              description: "Headlines linked to a ticker's moves, filtered by a substring of the title."
            Return shapes (documented in the descriptions, implemented in T10 queries.py):
              move dict: {date, ret, ret_z, gap_ret, intraday_ret, vol_z, direction, routing, near_earnings,
@@ -840,16 +841,17 @@ tasks:
 
       src/stock_moves/api/chat.py:
         router = APIRouter(tags=["chat"])
-        def make_tools(session: Session, default_ticker: str | None) -> dict[str, ToolFn]
+        def make_tools(session: Session, default_ticker: str | None, window: Window | None = None) -> dict[str, ToolFn]
+          # `window` (from stock_moves.timeframe) wins over any start/end in the call: model-sent dates are dropped.
           # The three tools named in TOOL_SPECS. Each accepts **kwargs, resolves ticker = (kwargs.get("ticker")
           # or default_ticker or raise ValueError("ticker required")).upper(), parses date strings with
           # date.fromisoformat, and returns JSON-serialisable dicts/lists:
-          #   list_moves(ticker?, start?, end?, direction?, limit=10) -> [move_to_dict(m, get_explanation(...))]
+          #   list_moves(ticker?, direction?, limit=10) -> [move_to_dict(m, get_explanation(...))]
           #       using MoveFilters(z_threshold=0.0, pct_threshold=0.0, ...) so the ordering by |z| does the work
           #   get_move(ticker?, date) -> move_to_dict(m, explanation, articles_for_move(m.id, limit=10))
           #       or {"error": f"no move for {ticker} on {date}"}; if the move exists but has no explanation,
           #       return it as-is (on-demand enrichment is the tickers route's job, not chat's).
-          #   search_news(ticker?, query?, start?, end?, limit=20) -> [article_to_dict(a, link)]
+          #   search_news(ticker?, query?, limit=20) -> [article_to_dict(a, link)]
         @router.post("/chat", response_model=ChatResponse)
         def chat(req: ChatRequest, session=Depends(get_db), provider=Depends(get_provider_dep)) -> ChatResponse
           # session_id = req.session_id or uuid4().hex; history = chat_history(session, session_id) as
