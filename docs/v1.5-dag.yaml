@@ -25,14 +25,16 @@ tasks:
     owns:
       - scripts/smoke_model.py
     prompt: |
-      Write scripts/smoke_model.py: a script (not a test) that loads Settings via
-      stock_moves.settings.get_settings(), builds AnthropicProvider from
-      stock_moves.providers.anthropic with the configured key and model, and makes ONE
-      cheap live call: provider.suggest_peers("AAPL", "Apple Inc.", "Technology",
-      "Consumer Electronics") or whatever the current suggest_peers signature is (read
-      providers/anthropic.py). Print the model name, the elapsed ms, and the parsed result.
-      On any exception print the exception class, its message, and the HTTP status if the
-      anthropic SDK exposes one, then exit 1. No key present: print "no key" and exit 2.
+      Write scripts/smoke_model.py: a script (not a test) that loads .env (python-dotenv,
+      explicit path REPO_ROOT/.env) and Settings via stock_moves.settings.get_settings(),
+      then builds the keyed provider the app would pick (read providers/__init__.py:
+      OpenAI first, then Anthropic) and makes ONE cheap live call: provider.suggest_peers
+      with AAPL's identity (read the current signature in providers/openai.py). The
+      keyed providers degrade to the heuristic on any exception by design, so the script
+      must call the SDK client directly as well (one chat completion asking for the word
+      OK) so a bad key is visible rather than swallowed. Print provider name, model,
+      elapsed ms, and the result of both calls. On SDK failure print the exception class,
+      message and HTTP status if exposed, exit 1. No key present: print "no key", exit 2.
       This script exists because v1 shipped with the model path unproven; it must be the
       first thing run on any machine. Add a two-line docstring saying so. No tests.
 
@@ -152,8 +154,11 @@ tasks:
     estimate_min: 45
     owns:
       - src/stock_moves/providers/base.py
+      - src/stock_moves/providers/prompts.py
+      - src/stock_moves/providers/openai.py
       - src/stock_moves/providers/anthropic.py
       - src/stock_moves/providers/heuristic.py
+      - tests/test_openai_provider.py
       - tests/test_anthropic_provider.py
       - tests/test_relations_provider.py
     prompt: |
@@ -177,15 +182,21 @@ tasks:
       HeuristicProvider.suggest_relations returns Relations(competitors=(), suppliers=(),
       customers=(), countries=()) — the ETF fallback is applied by ontology, not here — and
       the docstring says the geo gate cannot open without a key.
-      AnthropicProvider.suggest_relations: one call, structured output via a pydantic model
-      (follow the _Peers pattern), system prompt asks for up to 6 direct competitors as
-      tickers, up to 4 suppliers and 4 customers as tickers (public only, else omit), and
-      up to 5 countries as ISO alpha-2 with revenue-or-supply weights summing to at most 1.
-      Any failure returns the empty Relations and logs, matching how suggest_peers degrades.
+      Shared prompt and schema go in providers/prompts.py next to Peers / PEERS_SYSTEM /
+      peers_prompt: a pydantic RelationsOut model, RELATIONS_SYSTEM, and
+      relations_prompt(ticker, name, sector, industry). The system prompt asks for up to 6
+      direct competitors as tickers, up to 4 suppliers and 4 customers as tickers (public
+      only, else omit), and up to 5 countries as ISO alpha-2 with revenue-or-supply weights
+      summing to at most 1. Implement suggest_relations on BOTH OpenAIProvider (the keyed
+      provider this deployment uses; follow its suggest_peers transport exactly) and
+      AnthropicProvider (follow its suggest_peers). Any failure returns the empty Relations
+      and logs, matching how suggest_peers degrades. Read providers/__init__.py so the
+      protocol change is reflected wherever the three providers are typed.
       Also add TOOL_SPECS entry get_relations(ticker) -> {edges: [{dst, relation, weight,
       source}]} for the chat loop; the callable is wired in R11.
-      Tests with the existing fake client pattern: the parse, the clamp on weights, the
-      degrade path.
+      Tests with the existing fake client patterns in test_openai_provider.py and
+      test_anthropic_provider.py: the parse, the clamp on weights, the degrade path, for
+      both providers. New tests may live in tests/test_relations_provider.py.
 
   - id: R5
     title: Geopolitical headline counts per country
@@ -365,23 +376,29 @@ tasks:
     estimate_min: 40
     owns:
       - src/stock_moves/explain.py
-      - src/stock_moves/providers/anthropic.py
-      - src/stock_moves/providers/heuristic.py
+      - src/stock_moves/narrate.py
+      - src/stock_moves/providers/prompts.py
       - tests/test_explain.py
+      - tests/test_narrate.py
     prompt: |
       Decision 9 of docs/v1.5-plan.md. explain.build_context fills the new MoveContext
       fields from the Move row and the edge tables (ontology.relation_tickers,
       ontology.country_codes, and the move-window geo_events rows rendered as
-      "YYYY-MM-DD CC N headlines: <first sample title>"). AnthropicProvider._move_block
-      renders sub_routing, macro_driver with its component, rival_comove, chain_comove,
-      competitors/suppliers/customers/countries, and the geo_events lines; _EXPLAIN_SYSTEM
-      gains two sentences: when sub_routing is share_shift name the rival and the direction;
-      when it is country:XX say "geopolitical, via <country> exposure" and cite the geo
-      event only if a cited article supports it. HeuristicProvider.explain (F3 has edited
-      it; read it) gains the same two template sentences, e.g. "Macro, geopolitical, via
-      Taiwan exposure: the Taiwan ETF moved N.N% and 14 tariff headlines named Taiwan." and
-      "Share shift: AMD rose 3.1% the same day." Tests: the two templates render with the
-      right numbers; a context with no new signals renders exactly the v1 sentence.
+      "YYYY-MM-DD CC N headlines: <first sample title>"). The prose lives in narrate.py
+      (MoveFacts, summary_sentences) and is consumed by BOTH the heuristic explain and the
+      keyed providers' prompts via prompts.narrative_block, so you do not touch any
+      provider file: add the new fields to MoveFacts.from_context, and two new sentence
+      builders wired into summary_sentences: share_shift_sentence ("Share shift: AMD rose
+      3.1% the same day.") and geo_sentence ("Macro, geopolitical, via Taiwan exposure: the
+      Taiwan ETF moved N.N% and 14 tariff headlines named Taiwan."), each returning None
+      when its signal is absent. In prompts.py, move_block adds sub_routing, macro_driver,
+      macro_driver_component, rival_comove, chain_comove, competitors, suppliers,
+      customers, countries, geo_events (nulls dropped as now), and EXPLAIN_SYSTEM gains two
+      sentences: when sub_routing is share_shift name the rival and the direction; when it
+      is country:XX say "geopolitical, via <country> exposure" and cite the geo event only
+      if a cited article supports it. Tests: the two sentences render with the right
+      numbers; a context with no new signals renders exactly the v1 sentences; move_block
+      drops the new keys when they are None.
 
   # ---------------------------------------------------------------- wave 4
   - id: R11
