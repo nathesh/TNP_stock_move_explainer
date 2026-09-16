@@ -22,7 +22,12 @@ worth reading on its own:
   how many reach the explainer. They are deliberately different numbers.
 * **Freshness and concurrency (DESIGN section 5).** `is_stale` decides whether
   a read needs an ingest, and a per-ticker `threading.Lock` stops two
-  simultaneous first requests from both ingesting the same ticker.
+  simultaneous first requests from both ingesting the same ticker. The promise
+  is *at most one ingest per trading day per ticker*, and keeping it takes a
+  watermark of our own: the feed's newest bar cannot be trusted to prove the
+  ingest happened, because a period-based `yfinance` fetch often still ends on
+  yesterday after today's close. So every completed run stamps
+  `companies.updated_at` (`_mark_ingested`) and `is_stale` reads that stamp.
 
 **v1.5: the relationship layer, wired in here and nowhere else.** The edge
 table, the factor attribution and the geopolitical counts are all built by
@@ -58,7 +63,7 @@ import math
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -68,7 +73,16 @@ from sqlmodel import Session, col, select
 
 from stock_moves import prices
 from stock_moves.explain import FALLBACK_PROVIDER_NAME, get_or_create_explanation
-from stock_moves.models import Company, CompanyEdge, Explanation, GeoEvent, Move, MoveArticle, Price
+from stock_moves.models import (
+    Company,
+    CompanyEdge,
+    Explanation,
+    GeoEvent,
+    Move,
+    MoveArticle,
+    Price,
+    utcnow,
+)
 from stock_moves.moves import (
     SUB_ROUTE_SHARE_SHIFT,
     SUB_ROUTE_SUPPLY_CHAIN,
@@ -108,6 +122,7 @@ __all__ = [
     "enrich_move",
     "ingest_ticker",
     "is_stale",
+    "last_close",
     "last_completed_trading_day",
     "needs_ingest",
 ]
@@ -207,23 +222,78 @@ def needs_ingest(session: Session, ticker: str) -> bool:
     return not has_prices(session, ticker)
 
 
-def is_stale(session: Session, ticker: str) -> bool:
+def last_close(now: datetime | None = None) -> datetime:
+    """The most recent 4pm ET close, as the naive UTC `utcnow` stores.
+
+    The boundary an ingest is measured against: a run that finished after it
+    has seen everything the last completed trading day can offer.
+    """
+    return _close_of(last_completed_trading_day(now))
+
+
+def _close_of(day: date) -> datetime:
+    """4pm ET on `day`, converted to the naive UTC that the tables store."""
+    close = datetime.combine(day, time(MARKET_CLOSE_HOUR_ET), tzinfo=_EASTERN)
+    return close.astimezone(UTC).replace(tzinfo=None)
+
+
+def _last_ingested_at(session: Session, ticker: str) -> datetime | None:
+    """When this ticker was last ingested, or None if it never was.
+
+    `ingest_ticker` stamps `companies.updated_at` at the end of every completed
+    run (`_mark_ingested`), so the column doubles as the ingest watermark. It
+    is deliberately a reused column rather than a new one: `models.py` is the
+    schema and a second timestamp there would have to be migrated into every
+    existing database to say what this one already says.
+    """
+    company = session.get(Company, ticker.strip().upper())
+    return None if company is None else company.updated_at
+
+
+def _mark_ingested(session: Session, company: Company) -> None:
+    """Stamp the ingest watermark `is_stale` reads. Call once a run has succeeded."""
+    company.updated_at = utcnow()
+    session.add(company)
+    session.commit()
+
+
+def is_stale(session: Session, ticker: str, *, now: datetime | None = None) -> bool:
     """Whether a read should trigger an ingest: no prices, or a missing day.
 
     True when nothing is stored, or when the newest stored price date is older
-    than `last_completed_trading_day()`. False means "at most one ingest per
-    trading day per ticker" has already been paid.
+    than `last_completed_trading_day()` **and** the last ingest of this ticker
+    predates that day's close. False means "at most one ingest per trading day
+    per ticker" (DESIGN section 5) has already been paid.
+
+    The second half of that rule is the whole point. `yfinance` is fetched by
+    `period`, not since a date, and the bar it returns lags: after the 4pm ET
+    close the newest daily bar is routinely still the previous day's. Judging
+    freshness on the stored bar alone therefore makes every read stale for
+    ever — a re-ingest on every page view, and a model call per page view with
+    a key set. The watermark says what the feed cannot: this ticker has already
+    been asked since the last close, and asking again would return the same
+    thing. `refresh=True` still forces an ingest; it does not go through here.
+
+    `now` is for tests and is interpreted exactly as `last_completed_trading_day`
+    interprets it.
     """
+    key = ticker.strip().upper()
     statement = (
         select(col(Price.date))
-        .where(col(Price.ticker) == ticker.strip().upper())
+        .where(col(Price.ticker) == key)
         .order_by(col(Price.date).desc())
         .limit(1)
     )
     newest = session.exec(statement).first()
     if newest is None:
         return True
-    return newest < last_completed_trading_day()
+
+    day = last_completed_trading_day(now)
+    if newest >= day:
+        return False
+
+    ingested = _last_ingested_at(session, key)
+    return ingested is None or ingested < _close_of(day)
 
 
 # --------------------------------------------------------------------------- #
@@ -933,6 +1003,14 @@ def ingest_ticker(
                 top_k=settings.top_k_articles,
                 related_returns=related_returns,
             )
+
+        # 5b. The ingest watermark. Stamped here, after the work and inside
+        #     the lock, so a run that raised never claims the ticker is fresh.
+        #     `is_stale` reads it because the feed's newest bar cannot prove an
+        #     ingest happened: a period-based fetch after the close usually
+        #     still ends on the previous day, which without this stamp makes
+        #     the ticker permanently stale and re-ingests on every read.
+        _mark_ingested(session, company)
 
         # 6. Counts read back from the tables, so they are totals and not a
         #    tally of what this particular run happened to insert.

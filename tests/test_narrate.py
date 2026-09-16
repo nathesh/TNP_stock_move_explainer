@@ -21,6 +21,7 @@ from stock_moves.narrate import (
     geo_sentence,
     narrate_moves,
     narrate_news,
+    narrate_relations,
     peers_sentence,
     share_shift_sentence,
     short_company_name,
@@ -741,3 +742,164 @@ def test_the_plural_header_covers_every_direction() -> None:
 def test_the_default_order_is_the_unusual_one() -> None:
     """`order` defaults to "z" because `MoveFilters` does."""
     assert "most unusual move" in narrate_moves("AAPL", [move_dict()], company="Apple")
+
+
+# --------------------------------------------------------------------------- #
+# narrate_relations (v1.5 decision 10)
+# --------------------------------------------------------------------------- #
+
+
+def edge(dst: str, relation: str, weight: float, source: str = "model") -> dict[str, Any]:
+    """One row of `get_relations`' `edges`, in the API's own shape."""
+    return {"dst": dst, "relation": relation, "weight": weight, "source": source}
+
+
+#: The edge set of a company that has been ingested with a key: rivals from the
+#: sector ETF, a supply chain and countries from the model, factors fitted from
+#: prices, and two of those factors near zero.
+FULL_EDGES: list[dict[str, Any]] = [
+    edge("AMD", "competitor", 0.9, "etf_holdings"),
+    edge("AVGO", "competitor", 0.8, "etf_holdings"),
+    edge("INTC", "competitor", 0.7, "etf_holdings"),
+    edge("MU", "competitor", 0.6, "etf_holdings"),
+    edge("MSFT", "competitor", 0.5, "etf_holdings"),
+    edge("TSM", "supplier", 0.7),
+    edge("ASML", "supplier", 0.6),
+    edge("MSFT", "customer", 0.8),
+    edge("TW", "country", 0.3),
+    edge("CN", "country", 0.15),
+    edge("dollar", "factor", -1.9, "prices"),
+    edge("gold", "factor", 0.5, "prices"),
+    edge("oil", "factor", 0.1, "prices"),
+    edge("rates", "factor", -0.05, "prices"),
+]
+
+
+def test_relations_group_by_relation_in_reading_order() -> None:
+    """One sentence per relation, rivals first and the fitted betas last."""
+    said = narrate_relations("NVDA", "", FULL_EDGES)
+
+    lines = said.split("\n")
+    assert lines[0].startswith("NVDA's closest listed competitors")
+    assert lines[1].startswith("Its suppliers")
+    assert lines[2].startswith("Its customer")
+    assert lines[3].startswith("It is exposed to")
+    assert lines[4].startswith("It moves most with")
+    assert len(lines) == 5
+
+
+def test_the_competitor_sentence_names_every_rival_strongest_first() -> None:
+    """Not the two-name cap the share-shift clause uses: this sentence *is* the
+    answer to the question, so a roster of five is five names."""
+    said = narrate_relations("NVDA", "", FULL_EDGES)
+
+    assert (
+        "NVDA's closest listed competitors on record are AMD, AVGO, INTC, MU and MSFT "
+        "(from the sector ETF's largest holdings)." in said
+    )
+
+
+def test_the_chain_and_country_sentences_say_their_numbers_and_their_source() -> None:
+    said = narrate_relations("NVDA", "", FULL_EDGES)
+
+    assert "Its suppliers on record are TSM and ASML (as suggested by the model)." in said
+    assert "Its customer on record is MSFT (as suggested by the model)." in said
+    # Weights as percentages, and the country code said as a country.
+    assert "It is exposed to Taiwan (30%) and China (15%) (as suggested by the model)." in said
+
+
+def test_the_factor_sentence_is_one_sentence_with_the_sign_kept() -> None:
+    """The label "beta" is said once, the small exposures are named rather than
+    dropped, and a negative loading keeps its minus sign."""
+    said = narrate_relations("NVDA", "", FULL_EDGES)
+
+    assert (
+        "It moves most with the dollar (beta -1.9) and gold (0.5); "
+        "oil and rates barely register." in said
+    )
+
+
+def test_every_source_has_a_phrase_of_its_own() -> None:
+    """The three stored sources, each said in English rather than as its
+    storage string."""
+    for source, phrase in (
+        ("etf_holdings", "from the sector ETF's largest holdings"),
+        ("model", "as suggested by the model"),
+        ("prices", "fitted from prices"),
+    ):
+        said = narrate_relations("NVDA", "", [edge("AMD", "competitor", 0.8, source)])
+        assert f"({phrase})" in said
+        # The storage string itself never reaches the reader.
+        assert "etf_holdings" not in said
+
+
+def test_an_unknown_source_is_left_out_rather_than_printed_raw() -> None:
+    said = narrate_relations("NVDA", "", [edge("AMD", "competitor", 0.8, "wikipedia")])
+
+    assert said == "NVDA's closest listed competitor on record is AMD."
+
+
+def test_a_singular_group_reads_in_the_singular() -> None:
+    said = narrate_relations(
+        "NVDA", "", [edge("AMD", "competitor", 0.8), edge("TSM", "supplier", 0.7)]
+    )
+
+    assert "closest listed competitor on record is AMD" in said
+    assert "Its supplier on record is TSM" in said
+
+
+def test_factors_that_all_sit_near_zero_are_still_answered() -> None:
+    """ "We fitted it and it came out near zero" is an answer; silence is not."""
+    said = narrate_relations(
+        "NVDA", "", [edge("oil", "factor", 0.1, "prices"), edge("gold", "factor", -0.05, "prices")]
+    )
+
+    assert said == "It barely moves with oil and gold."
+
+
+def test_one_small_factor_takes_the_singular_verb() -> None:
+    said = narrate_relations(
+        "NVDA",
+        "",
+        [edge("dollar", "factor", -1.9, "prices"), edge("oil", "factor", 0.01, "prices")],
+    )
+
+    assert said == "It moves most with the dollar (beta -1.9); oil barely registers."
+
+
+def test_relations_use_the_company_name_when_there_is_one() -> None:
+    said = narrate_relations("NVDA", "NVIDIA Corporation", [edge("AMD", "competitor", 0.8)])
+
+    assert said.startswith("NVIDIA's closest listed competitor")
+
+
+def test_no_edges_at_all_names_the_next_step() -> None:
+    assert (
+        narrate_relations("NVDA", "NVIDIA", [])
+        == "Nothing is on record for NVDA yet; ingest it first."
+    )
+
+
+def test_rows_that_name_nothing_read_as_no_edges() -> None:
+    """A malformed row is dropped, and a payload of nothing but malformed rows
+    is the empty answer rather than a sentence with a hole in it."""
+    said = narrate_relations("NVDA", "", [{"relation": "competitor", "weight": 0.8}, "junk"])
+
+    assert said == "Nothing is on record for NVDA yet; ingest it first."
+
+
+def test_a_relation_this_module_has_no_sentence_for_is_still_said() -> None:
+    said = narrate_relations(
+        "NVDA", "", [edge("AMD", "competitor", 0.8), edge("ARM", "licensor", 0.4)]
+    )
+
+    assert "Also on record, licensor: ARM." in said
+
+
+def test_relations_are_plain_text_with_real_newlines() -> None:
+    """The chat UI assigns to `textContent`, so markdown would show up as
+    literal asterisks."""
+    said = narrate_relations("NVDA", "", FULL_EDGES)
+
+    assert "*" not in said and "#" not in said and "\\n" not in said
+    assert said.count("\n") == 4

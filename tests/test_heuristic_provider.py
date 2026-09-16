@@ -362,14 +362,25 @@ def _chat_tools(
     search_news, search_news_calls = recording_tool(
         [{"id": 9, "title": "Testco in the news", "source": "WSJ"}]
     )
+    get_relations, get_relations_calls = recording_tool(
+        {
+            "ticker": "TEST",
+            "edges": [
+                {"dst": "AMD", "relation": "competitor", "weight": 0.8, "source": "etf_holdings"},
+                {"dst": "TSM", "relation": "supplier", "weight": 0.7, "source": "model"},
+            ],
+        }
+    )
     tools: dict[str, ToolFn] = {
         "get_move": get_move,
         "list_moves": list_moves,
+        "get_relations": get_relations,
         "search_news": search_news,
     }
     calls = {
         "get_move": get_move_calls,
         "list_moves": list_moves_calls,
+        "get_relations": get_relations_calls,
         "search_news": search_news_calls,
     }
     return tools, calls
@@ -647,3 +658,82 @@ def test_the_list_moves_spec_documents_the_order_argument() -> None:
     assert "biggest" in order["description"]
     # The description no longer promises one ordering unconditionally.
     assert "sorted by absolute z-score" not in spec["description"]
+
+
+# --------------------------------------------------------------------------- #
+# Relations questions (v1.5 decision 10)
+# --------------------------------------------------------------------------- #
+
+
+def _routed(message: str) -> tuple[str, dict[str, Any]]:
+    """The one tool the router picked for this message, and its arguments."""
+    tools, calls = _chat_tools()
+    PROVIDER.chat([ChatTurn("user", message)], tools, None)
+    picked = [(name, rows[0]) for name, rows in calls.items() if rows]
+    assert len(picked) == 1, f"expected one tool call, got {picked}"
+    return picked[0]
+
+
+def test_a_relations_question_reaches_get_relations() -> None:
+    """The defect: these used to fall through to `list_moves` and answer a
+    question about rivals with a wall of daily moves."""
+    for message in (
+        "Who does TEST compete with?",
+        "which suppliers does TEST depend on?",
+        "what countries is TEST exposed to?",
+    ):
+        name, payload = _routed(message)
+        assert name == "get_relations", message
+        # Edges are facts about the company: no window, no date, no limit.
+        assert payload == {"ticker": "TEST"}
+
+
+def test_news_still_wins_over_a_relations_word() -> None:
+    """A question that says "news" wants headlines even when it also names a
+    relation, so the news branch stays first in the router."""
+    name, _ = _routed("news about TEST's competitors")
+    assert name == "search_news"
+
+
+def test_a_dated_question_still_reaches_get_move() -> None:
+    name, payload = _routed("what happened to TEST on 2025-06-03?")
+    assert name == "get_move"
+    assert payload["date"] == "2025-06-03"
+
+
+def test_a_dated_relations_question_answers_with_the_edges() -> None:
+    """Relations are checked before the date: a year in the question narrows
+    nothing about an edge, and `get_move` would answer a different question."""
+    name, _ = _routed("which countries was TEST exposed to on 2025-06-03?")
+    assert name == "get_relations"
+
+
+def test_a_plain_question_is_untouched_by_the_new_branch() -> None:
+    name, _ = _routed("what moved TEST around?")
+    assert name == "list_moves"
+
+
+def test_a_relation_word_inside_another_word_is_not_a_relations_question() -> None:
+    """Whole-word matching: "rivalry" is commentary about a stock, not a
+    question about an edge, and a substring rule would route it wrong."""
+    name, _ = _routed("how did the TEST rivalry play out?")
+    assert name == "list_moves"
+
+
+def test_the_relations_reply_reads_the_edges_out_loud() -> None:
+    tools, _ = _chat_tools()
+    reply = PROVIDER.chat([ChatTurn("user", "who does TEST compete with?")], tools, None)
+
+    assert "closest listed competitor on record is AMD" in reply.reply
+    assert "from the sector ETF's largest holdings" in reply.reply
+    assert "Its supplier on record is TSM" in reply.reply
+    assert [tc.name for tc in reply.tool_calls] == ["get_relations"]
+
+
+def test_a_relations_question_with_no_edges_says_so() -> None:
+    get_relations, _ = recording_tool({"ticker": "TEST", "edges": []})
+    reply = PROVIDER.chat(
+        [ChatTurn("user", "who are TEST's rivals?")], {"get_relations": get_relations}, None
+    )
+
+    assert reply.reply == "Nothing is on record for TEST yet; ingest it first."

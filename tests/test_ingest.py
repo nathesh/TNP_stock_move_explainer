@@ -22,6 +22,7 @@ from synth import synthetic_market, synthetic_ohlcv
 from stock_moves import ingest, prices
 from stock_moves.models import (
     Article,
+    Company,
     CompanyEdge,
     Explanation,
     GeoEvent,
@@ -614,17 +615,172 @@ def test_needs_ingest_and_is_stale(
     monkeypatch.setattr(ingest, "last_completed_trading_day", lambda now=None: newest)
     assert ingest.is_stale(session, TICKER) is False
 
-    # One trading day later and the ticker is stale again.
+    # One trading day later, the stored bar has fallen behind — but that is
+    # only half the rule: the run that just happened is still the most recent
+    # ingest, so there is nothing to re-ask for yet.
     monkeypatch.setattr(
         ingest,
         "last_completed_trading_day",
         lambda now=None: newest + timedelta(days=3),
     )
+    assert ingest.is_stale(session, TICKER) is False
+
+    # Once that ingest also predates the last close, both halves hold and the
+    # ticker is stale again.
+    set_watermark(session, TICKER, ingest.last_close() - timedelta(minutes=1))
     assert ingest.is_stale(session, TICKER) is True
 
     # An unknown ticker is always stale: there is nothing stored at all.
     assert ingest.is_stale(session, "NOPE") is True
     assert ingest.needs_ingest(session, "NOPE") is True
+
+
+# --------------------------------------------------------------------------- #
+# Freshness: the ingest watermark
+# --------------------------------------------------------------------------- #
+
+#: A Monday, 17:30 ET, i.e. after that day's 4pm close. The previous trading
+#: day is Friday 2026-09-11.
+AFTER_THE_CLOSE = datetime(2026, 9, 14, 17, 30, tzinfo=_EASTERN)
+LAGGING_BAR = date(2026, 9, 11)
+
+WATERMARK_TICKER = "WMRK"
+
+
+def set_watermark(session: Session, ticker: str, when: datetime) -> None:
+    """Pretend this ticker was last ingested at `when` (naive UTC, as stored)."""
+    company = session.get(Company, ticker)
+    assert company is not None
+    company.updated_at = when
+    session.add(company)
+    session.commit()
+
+
+def store_one_bar(
+    session: Session,
+    ticker: str,
+    *,
+    newest: date | None,
+    ingested_at: datetime,
+) -> None:
+    """A company row with a given ingest watermark, and at most one price bar.
+
+    Enough of a database for `is_stale` and nothing more: it reads the newest
+    stored price date and `companies.updated_at`, so a full ingest would only
+    make the arrangement harder to see.
+    """
+    session.add(Company(ticker=ticker, name="Watermark Corp", updated_at=ingested_at))
+    if newest is not None:
+        session.add(
+            Price(
+                ticker=ticker,
+                date=newest,
+                open=100.0,
+                high=101.0,
+                low=99.0,
+                close=100.5,
+                volume=1e6,
+            )
+        )
+    session.commit()
+
+
+def test_is_stale_false_when_the_last_ingest_is_after_the_close(session: Session) -> None:
+    """The defect this watermark exists for: a lagging bar is not a stale ticker.
+
+    `yfinance` is fetched by period and its newest daily bar after the close is
+    routinely still the previous day's, so the stored bar alone would report
+    this ticker stale on every single read.
+    """
+    store_one_bar(
+        session,
+        WATERMARK_TICKER,
+        newest=LAGGING_BAR,
+        ingested_at=ingest.last_close(AFTER_THE_CLOSE) + timedelta(minutes=5),
+    )
+
+    assert ingest.last_completed_trading_day(AFTER_THE_CLOSE) == date(2026, 9, 14)
+    assert ingest.is_stale(session, WATERMARK_TICKER, now=AFTER_THE_CLOSE) is False
+
+
+def test_is_stale_true_when_the_last_ingest_predates_the_close(session: Session) -> None:
+    """Same lagging bar, but the last ingest was before the close: ask again."""
+    store_one_bar(
+        session,
+        WATERMARK_TICKER,
+        newest=LAGGING_BAR,
+        ingested_at=ingest.last_close(AFTER_THE_CLOSE) - timedelta(hours=2),
+    )
+
+    assert ingest.is_stale(session, WATERMARK_TICKER, now=AFTER_THE_CLOSE) is True
+
+
+def test_is_stale_true_with_no_prices_however_recent_the_watermark(session: Session) -> None:
+    """Nothing stored is stale whatever the company row says."""
+    store_one_bar(
+        session,
+        WATERMARK_TICKER,
+        newest=None,
+        ingested_at=ingest.last_close(AFTER_THE_CLOSE) + timedelta(minutes=5),
+    )
+
+    assert ingest.is_stale(session, WATERMARK_TICKER, now=AFTER_THE_CLOSE) is True
+    assert ingest.is_stale(session, "NEVER-SEEN", now=AFTER_THE_CLOSE) is True
+
+
+def test_is_stale_false_when_the_stored_bar_is_current(session: Session) -> None:
+    """A bar for the last completed trading day needs no watermark at all."""
+    store_one_bar(
+        session,
+        WATERMARK_TICKER,
+        newest=date(2026, 9, 14),
+        ingested_at=ingest.last_close(AFTER_THE_CLOSE) - timedelta(days=30),
+    )
+
+    assert ingest.is_stale(session, WATERMARK_TICKER, now=AFTER_THE_CLOSE) is False
+
+
+def test_ingest_stamps_the_watermark_on_every_run(
+    session: Session,
+    no_network: None,
+    news: FakeNewsSource,
+    provider: HeuristicProvider,
+) -> None:
+    """Including a second run, which does not rebuild the company row.
+
+    `get_or_build_company` short-circuits on a stored row, so the stamp cannot
+    ride along on it — `ingest_ticker` sets it itself, after the work.
+    """
+    run_ingest(session, news, provider)
+    company = session.get(Company, TICKER)
+    assert company is not None
+
+    backdated = ingest.last_close() - timedelta(days=30)
+    set_watermark(session, TICKER, backdated)
+
+    run_ingest(session, news, provider)
+
+    session.refresh(company)
+    assert company.updated_at > backdated
+    # And that is what makes the next read cheap: the synthetic history ends
+    # months ago, so the stored bar is old, yet the ticker is not stale.
+    assert ingest.is_stale(session, TICKER) is False
+
+
+def test_refresh_ingests_even_when_the_watermark_is_fresh(
+    session: Session,
+    no_network: None,
+    news: FakeNewsSource,
+    provider: HeuristicProvider,
+) -> None:
+    """`refresh=True` never consults `is_stale`; it forces the run."""
+    run_ingest(session, news, provider)
+    assert ingest.is_stale(session, TICKER) is False
+    calls_after_first = news.calls
+
+    run_ingest(session, news, provider, refresh=True)
+
+    assert news.calls > calls_after_first
 
 
 # --------------------------------------------------------------------------- #

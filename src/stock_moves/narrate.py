@@ -39,6 +39,7 @@ __all__ = [
     "narrate_moves",
     "narrate_news",
     "narrate_one_move",
+    "narrate_relations",
     "plain_day",
     "plain_move",
     "short_company_name",
@@ -84,6 +85,42 @@ _FACTOR_DRIVERS: frozenset[str] = frozenset({"oil", "dollar", "rates", "gold"})
 #: rather than re-queried because `narrate` never touches the database — the
 #: caller has already turned the rows into these lines.
 _GEO_LINE = re.compile(r"^(\d{4}-\d{2}-\d{2})\s+([A-Za-z]{2})\s+(\d+)\s+headlines")
+
+#: The five relations an edge can carry (v1.5 decision 10), in the order a
+#: reader wants them: who the company competes with first, because that is the
+#: question people actually ask, and the fitted factor betas last, because they
+#: are the least concrete thing on the list.
+_RELATION_ORDER: tuple[str, ...] = (
+    "competitor",
+    "supplier",
+    "customer",
+    "country",
+    "factor",
+)
+
+#: How a factor is said. Only the dollar takes an article in English, and
+#: "rates" is already the plain word for the thing the proxy tracks.
+_FACTOR_LABELS: dict[str, str] = {
+    "oil": "oil",
+    "dollar": "the dollar",
+    "rates": "rates",
+    "gold": "gold",
+}
+
+#: Below this absolute beta, a one-standard-deviation move in the proxy shifts
+#: the stock by less than a fifth of one of its own: true, and not worth a
+#: reader's attention. Said as "barely registers" rather than dropped, because
+#: "we fitted it and it came out near zero" is itself an answer.
+_FACTOR_NOTABLE = 0.2
+
+#: Where an edge came from, said in English. The difference between a number
+#: fitted from prices and a name a language model volunteered is the whole
+#: reason `source` is stored, so it is said out loud rather than implied.
+_SOURCE_PHRASES: dict[str, str] = {
+    "etf_holdings": "from the sector ETF's largest holdings",
+    "model": "as suggested by the model",
+    "prices": "fitted from prices",
+}
 
 _NUMBER_WORDS: dict[int, str] = {
     2: "twice",
@@ -963,6 +1000,161 @@ def narrate_news(ticker: str, articles: Sequence[Mapping[str, Any]], limit: int 
     for day, rows in by_day.items():
         sections.append("\n".join([f"  {day}", *headline_lines(rows, limit=len(rows))]))
     return "\n\n".join(sections)
+
+
+# --------------------------------------------------------------------------- #
+# Saying the edges
+# --------------------------------------------------------------------------- #
+
+
+def _relation_group(
+    edges: Sequence[Mapping[str, Any]], relation: str
+) -> list[tuple[str, float, str]]:
+    """One relation's edges as `(dst, weight, source)`, strongest first.
+
+    Weight order rather than the alphabetical order the query layer returns:
+    the answer to "who does it compete with" is the closest rival, and an ETF's
+    holdings carry their size in the weight. `sorted` is stable, so edges of
+    equal weight keep the order they arrived in. A row with no `dst` is
+    dropped -- it names nothing, and printing an empty name would be worse
+    than being one name short.
+    """
+    rows: list[tuple[str, float, str]] = []
+    for edge in edges:
+        if not isinstance(edge, Mapping) or _as_str(edge.get("relation")) != relation:
+            continue
+        dst = _as_str(edge.get("dst"))
+        if dst is None:
+            continue
+        weight = _as_float(edge.get("weight"))
+        rows.append((dst, 0.0 if weight is None else weight, _as_str(edge.get("source")) or ""))
+    return sorted(rows, key=lambda row: -abs(row[1]))
+
+
+def _source_clause(rows: Sequence[tuple[str, float, str]]) -> str:
+    """` (from the sector ETF's largest holdings)`, or nothing at all.
+
+    Sources are de-duplicated in the order they appear, so a group that came
+    from one place reads as one phrase. An unrecognised source name is left
+    out rather than printed raw: a storage string in the middle of a sentence
+    tells the reader less than no clause does.
+    """
+    seen = dict.fromkeys(row[2] for row in rows)
+    phrases = [_SOURCE_PHRASES[source] for source in seen if source in _SOURCE_PHRASES]
+    return f" ({_join(phrases)})" if phrases else ""
+
+
+def _competitor_sentence(subject: str, rows: Sequence[tuple[str, float, str]]) -> str:
+    """The whole roster, not the two-name cap `_name_list` applies elsewhere.
+
+    A share-shift clause inside a move is making a point about where the money
+    went, so two names and a count carry it. This sentence *is* the answer to
+    the question asked, so leaving rivals out of it would be answering a
+    different one.
+    """
+    names = _join([row[0] for row in rows])
+    clause = _source_clause(rows)
+    if len(rows) == 1:
+        return f"{subject}'s closest listed competitor on record is {names}{clause}."
+    return f"{subject}'s closest listed competitors on record are {names}{clause}."
+
+
+def _chain_sentence(rows: Sequence[tuple[str, float, str]], noun: str) -> str:
+    """`Its suppliers on record are TSM and ASML (as suggested by the model).`"""
+    names = _join([row[0] for row in rows])
+    clause = _source_clause(rows)
+    if len(rows) == 1:
+        return f"Its {noun} on record is {names}{clause}."
+    return f"Its {noun}s on record are {names}{clause}."
+
+
+def _country_sentence(rows: Sequence[tuple[str, float, str]]) -> str:
+    """Countries by name, with the weight as a percentage.
+
+    The weight is that source's strength, not a share of revenue, so it is
+    attached to the country rather than described -- a reader who sees `(30%)`
+    next to a source clause can tell what kind of number it is, and a sentence
+    that called it "30% of its business" would be inventing a fact.
+    """
+    named = [f"{_country_name(dst.upper())} ({weight:.0%})" for dst, weight, _ in rows]
+    return f"It is exposed to {_join(named)}{_source_clause(rows)}."
+
+
+def _factor_label(name: str) -> str:
+    """`dollar` -> `the dollar`; an unmapped proxy is its own name."""
+    return _FACTOR_LABELS.get(name.lower(), name)
+
+
+def _factor_sentence(rows: Sequence[tuple[str, float, str]]) -> str:
+    """The fitted exposures as one sentence, loudest first.
+
+    The word "beta" appears once, on the first number, and the rest are bare:
+    repeating the label four times is a table, not a sentence, and the reader
+    only needs telling once what kind of number is in the brackets. No source
+    clause -- a beta is fitted from prices by construction, so the clause would
+    say what the word already said.
+    """
+    strong = [row for row in rows if abs(row[1]) >= _FACTOR_NOTABLE]
+    weak = [_factor_label(row[0]) for row in rows if abs(row[1]) < _FACTOR_NOTABLE]
+    if not strong:
+        return f"It barely moves with {_join(weak)}."
+
+    named = [
+        f"{_factor_label(dst)} ({'beta ' if index == 0 else ''}{weight:.1f})"
+        for index, (dst, weight, _) in enumerate(strong)
+    ]
+    sentence = f"It moves most with {_join(named)}"
+    if not weak:
+        return f"{sentence}."
+    verb = "barely registers" if len(weak) == 1 else "barely register"
+    return f"{sentence}; {_join(weak)} {verb}."
+
+
+def narrate_relations(
+    ticker: str,
+    company_name: str,
+    edges: Sequence[Mapping[str, Any]],
+) -> str:
+    """The stored edges of one company, read out loud (v1.5 decision 10).
+
+    The keyless answer to "who does NVDA compete with?". `get_relations`
+    returns `{ticker, edges: [{dst, relation, weight, source}]}`, which is a
+    table; this turns it into the four or five sentences a reader wanted --
+    rivals, then the supply chain, then country exposure, then the fitted
+    factor betas -- each one naming where its claim came from.
+
+    An empty edge list is a real answer rather than an error (v1.5 decision 3:
+    without a key there are no model relations at all), so it is said as the
+    next step it actually is: ingest the ticker.
+    """
+    rows = [edge for edge in edges if isinstance(edge, Mapping)]
+    subject = short_company_name(company_name or ticker, ticker)
+    grouped = {relation: _relation_group(rows, relation) for relation in _RELATION_ORDER}
+
+    lines: list[str] = []
+    if grouped["competitor"]:
+        lines.append(_competitor_sentence(subject, grouped["competitor"]))
+    if grouped["supplier"]:
+        lines.append(_chain_sentence(grouped["supplier"], "supplier"))
+    if grouped["customer"]:
+        lines.append(_chain_sentence(grouped["customer"], "customer"))
+    if grouped["country"]:
+        lines.append(_country_sentence(grouped["country"]))
+    if grouped["factor"]:
+        lines.append(_factor_sentence(grouped["factor"]))
+
+    # A relation this module has no sentence for is still a stored fact, and a
+    # later decision could add one. Naming it plainly beats dropping rows the
+    # database holds and the reader asked about.
+    known = set(_RELATION_ORDER)
+    extra = sorted({str(edge.get("relation") or "") for edge in rows} - known - {""})
+    for relation in extra:
+        named = _join([row[0] for row in _relation_group(rows, relation)])
+        lines.append(f"Also on record, {relation}: {named}.")
+
+    if not lines:
+        return f"Nothing is on record for {ticker} yet; ingest it first."
+    return "\n".join(lines)
 
 
 def _articles_of(move: Mapping[str, Any]) -> list[Mapping[str, Any]]:

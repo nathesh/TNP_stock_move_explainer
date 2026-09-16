@@ -169,11 +169,18 @@ and each is a consequence of how serverless hosting differs from a laptop:
   `uv run python scripts/renarrate_snapshot.py` rewrites the snapshot's keyless
   explanations in place and re-gzips it, off the network and without a key.
 
-  **The snapshot must be rebuilt for v1.5.** The committed one predates the
-  relationship layer: one year of data, null regimes, and none of the new
-  tables or columns. Delete the working `data/snapshot.db` first — schema
+  **When and how to rebuild it.** The committed snapshot is a v1.5 one: 110
+  large caps, two years each, every new table and column present, and every
+  stored explanation keyless. It was built with no key, so its only edges are
+  `competitor` from the sector ETFs' holdings and `factor` from prices — there
+  are no model-suggested supplier, customer or country edges in it, and so no
+  geo events either, because a geo query is only run for a country the company
+  has an edge to. A rebuild with a key set adds both, and writes the
+  explanations through the keyed provider. Rebuild when the schema gains a
+  column, when the two years have aged out from under the demo, or to bring
+  those keyed edges in. Delete the working `data/snapshot.db` first — schema
   creation adds missing tables but never columns to an existing one — then
-  rerun `scripts/build_snapshot.py`, which now ingests two years.
+  rerun `scripts/build_snapshot.py`.
 
 ```bash
 vercel deploy          # preview
@@ -204,11 +211,18 @@ curl -s -X POST 'http://127.0.0.1:8000/tickers/AAPL/ingest?period=2y&top_n=5' | 
 ```json
 {
   "ticker": "AAPL", "period": "2y", "top_n": 5,
-  "n_prices": 502, "n_moves": 86, "n_articles": 291, "n_explanations": 5,
-  "provider": "openai", "news_source": "google_rss",
-  "n_edges": 14, "n_geo_events": 3
+  "n_prices": 500, "n_moves": 86, "n_articles": 291, "n_explanations": 5,
+  "provider": "heuristic", "news_source": "google_rss",
+  "n_edges": 11, "n_geo_events": 0
 }
 ```
+
+Those are the keyless numbers, which is what a fresh checkout gets: the 11
+edges are `competitor` from the sector ETF's holdings plus the price-fitted
+`factor` betas, and `n_geo_events` is 0 because a geo query is only run for a
+country the company has an edge to. With `OPENAI_API_KEY` set the same call
+adds model-suggested supplier, customer and country edges, the geo events those
+countries make possible, and reads `"provider": "openai"`.
 
 Read the moves back, biggest first, down days only:
 
@@ -321,4 +335,4 @@ See [DESIGN.md](DESIGN.md) for the decisions and why,
 - No scheduled ingest; data goes stale until `?refresh=true`.
 - Single-day moves only; multi-day drifts and gap-then-reversal patterns are not modeled.
 - No executive or social commentary sources.
-- SQLite on local disk; not deployable as-is to a serverless host.
+- On the serverless deployment the database is a per-instance copy in `/tmp`, re-seeded from the snapshot on every cold start: what one instance ingests, another never sees, and neither keeps it for long.

@@ -120,6 +120,33 @@ _COUNT_WORDS: tuple[str, ...] = (
     "several",
 )
 
+#: Words that ask about the company's *edges* rather than about its days
+#: (v1.5 decision 10). Matched whole-word on the normalised text, so "country"
+#: does not fire on "countryside" and "rival" does not fire on "rivalry", and
+#: both the singular and the plural of each noun are listed because whole-word
+#: matching gives no stemming. "depend on" is two tokens with one space, which
+#: is what `_normalise` leaves behind.
+_RELATION_WORDS: tuple[str, ...] = (
+    "compete",
+    "competitor",
+    "competitors",
+    "rival",
+    "rivals",
+    "supplier",
+    "suppliers",
+    "customer",
+    "customers",
+    "exposure",
+    "exposed",
+    "countries",
+    "country",
+    "relation",
+    "relations",
+    "related",
+    "depend on",
+    "peers",
+)
+
 #: A digit count ("top 3"). One or two digits only, so a bare year does not
 #: read as a row count.
 _COUNT_DIGITS_RE = re.compile(r"(?<!\d)\d{1,2}(?!\d)")
@@ -302,6 +329,18 @@ def _names_several(lowered: str) -> bool:
     if any(_has_word(norm, word) for word in _COUNT_WORDS):
         return True
     return _COUNT_DIGITS_RE.search(norm) is not None
+
+
+def _asks_about_relations(text: str) -> bool:
+    """True when the question is about who the company is connected to.
+
+    Whole-word, against the normalised text, for the same reason
+    `_wants_superlative` is: under a substring rule "the arrival of the new
+    chip" contains "rival" and "unrelated to earnings" contains "related",
+    and both would be answered with a table of edges.
+    """
+    norm = _normalise(text)
+    return any(_has_word(norm, word) for word in _RELATION_WORDS)
 
 
 def _no_move_sentence(error: str) -> str:
@@ -501,6 +540,18 @@ class HeuristicProvider:
 
         Same endpoint, same response shape as the model path: keyword routing
         replaces the tool-calling loop.
+
+        The branch order is the rule, and it is deliberate:
+
+        1. `news`/`headline` first, so "news about competitors" searches the
+           headlines. A question that names the word "news" is asking for
+           coverage even when it also names a relation, and the relations tool
+           has no headlines to give it.
+        2. relations next, *before* the date, so "which countries was TEST
+           exposed to in 2025?" answers with the edges rather than with one
+           day's move. Edges are facts about the company, not about a day, so
+           a date in the question narrows nothing.
+        3. a date, then the survey list as the fallback.
         """
         text = _last_user_text(history)
         lowered = text.lower()
@@ -519,6 +570,9 @@ class HeuristicProvider:
         if "news" in lowered or "headline" in lowered:
             name = "search_news"
             payload = {"ticker": resolved, "limit": 10}
+        elif _asks_about_relations(text):
+            name = "get_relations"
+            payload = {"ticker": resolved}
         elif day is not None:
             name = "get_move"
             payload = {"ticker": resolved, "date": day}
@@ -582,6 +636,9 @@ class HeuristicProvider:
                 direction=payload.get("direction"),
                 order=str(payload.get("order") or "z"),
             )
+
+        if name == "get_relations":
+            return narrate.narrate_relations(ticker, company, _as_list(output, "edges"))
 
         return narrate.narrate_news(ticker, _as_list(output, "articles"))
 

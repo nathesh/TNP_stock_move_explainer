@@ -14,6 +14,15 @@ can route `company` (Nvidia's own charge) or `macro` (the country exposure), and
 the plan says so. Routing and sub-routing are judged separately, so a run that
 routes correctly but sub-routes wrongly says which half broke.
 
+The plan's pass rule has a second half — "at least one cited article names the
+event" — so each case also carries the words that would name its event, and the
+citation is judged as a third verdict. A case whose move is outside the ingest's
+explained top-N has no stored explanation to read, so this script explains it on
+demand first, exactly the way `GET /tickers/{ticker}/moves/{date}` does: same
+session, same provider, same news source. The first three cited titles are
+printed for every case, because *which* headline the retrieval put first is as
+much of the result as the verdict is.
+
 Exit codes: 0 every case passed, 1 at least one failed (a missing move on the
 date counts as a failure — the day is supposed to clear the move thresholds).
 
@@ -38,10 +47,11 @@ from dotenv import load_dotenv
 
 from stock_moves.db import Session, configure_engine, init_db, session_scope
 from stock_moves.explain import FALLBACK_PROVIDER_NAME
-from stock_moves.ingest import IngestResult, ingest_ticker
+from stock_moves.ingest import IngestResult, enrich_move, ingest_ticker
 from stock_moves.models import Article, Explanation, Move
-from stock_moves.providers import get_provider
-from stock_moves.queries import get_explanation, get_move
+from stock_moves.news import NewsSource, get_news_source
+from stock_moves.providers import ModelProvider, get_provider
+from stock_moves.queries import get_company, get_explanation, get_move
 from stock_moves.settings import REPO_ROOT, get_settings
 
 __all__ = ["EVAL_CASES", "EvalCase", "main"]
@@ -53,6 +63,10 @@ EXIT_FAILED = 1
 #: the 2025 dates arrive. The v1.5 plan makes this the default everywhere.
 PERIOD = "2y"
 
+#: How many cited titles are printed per case. Three is enough to see whether
+#: the retrieval put the day's real story first or buried it.
+CITED_SHOWN = 3
+
 
 @dataclass(frozen=True)
 class EvalCase:
@@ -61,6 +75,12 @@ class EvalCase:
     `expected_routing` and `expected_sub_routing` are tuples of *accepted*
     values, not single answers; `(None,)` means the correct answer is no
     sub-routing at all (an `industry` day has no sub-bucket).
+
+    `citation_keywords` is the other half of the plan's pass rule: words that a
+    headline about *this* event would contain. One cited title containing one of
+    them is enough — the rule is "names the event", not "is the best story on
+    the day" — and the match is a case-insensitive substring of the title alone,
+    not of the source.
     """
 
     ticker: str
@@ -68,6 +88,7 @@ class EvalCase:
     what_happened: str
     expected_routing: tuple[str, ...]
     expected_sub_routing: tuple[str | None, ...]
+    citation_keywords: tuple[str, ...]
 
 
 #: The eval table from `docs/v1.5-plan.md`, decided before the build and
@@ -81,6 +102,7 @@ EVAL_CASES: tuple[EvalCase, ...] = (
         what_happened="export-licence requirement on H20, $5.5B charge; TSM down 3.6% the same day",
         expected_routing=("company", "macro"),
         expected_sub_routing=("supply_chain", "country:CN", "country:TW"),
+        citation_keywords=("H20", "export", "China", "charge"),
     ),
     EvalCase(
         ticker="NVDA",
@@ -88,6 +110,7 @@ EVAL_CASES: tuple[EvalCase, ...] = (
         what_happened="DeepSeek day, chip names down together (AMD -6.4%, so rivals moved *with* it)",
         expected_routing=("industry",),
         expected_sub_routing=(None,),
+        citation_keywords=("DeepSeek",),
     ),
     EvalCase(
         ticker="AAPL",
@@ -95,6 +118,7 @@ EVAL_CASES: tuple[EvalCase, ...] = (
         what_happened="tariff announcement, the day after 2025-04-02",
         expected_routing=("macro",),
         expected_sub_routing=("country:CN", "dollar"),
+        citation_keywords=("tariff", "tariffs"),
     ),
 )
 
@@ -113,7 +137,17 @@ def main(argv: list[str] | None = None) -> int:
     configure_engine(f"sqlite:///{db_path}")
     init_db()
 
-    configured = get_provider(settings).name
+    # The same two objects the API resolves per request, built once here and
+    # handed to every on-demand explanation, so a case outside the ingest's
+    # top-N is explained by exactly the path `read_move` would have taken.
+    provider = get_provider(settings)
+    news_source = get_news_source(
+        settings.news_source,
+        timeout_s=settings.http_timeout_s,
+        throttle_s=settings.gdelt_throttle_s,
+    )
+
+    configured = provider.name
     print(f"db:       {db_path}")
     print(f"env:      {REPO_ROOT / '.env'}")
     print(f"period:   {PERIOD}")
@@ -131,7 +165,7 @@ def main(argv: list[str] | None = None) -> int:
             print()
             failed_cases += 1
             continue
-        case_failures = _judge(case)
+        case_failures = _judge(case, provider, news_source)
         if case_failures:
             failed_cases += 1
             failures.extend(case_failures)
@@ -156,7 +190,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         prog="eval_v15.py",
         description=(
             "Run the three v1.5 eval cases against live data. "
-            "Exits 1 if any routing or sub-routing does not match."
+            "Exits 1 if any routing, sub-routing or citation does not match."
         ),
     )
     parser.add_argument(
@@ -207,7 +241,7 @@ def _ingest_all(keep_db: bool) -> tuple[list[IngestResult], dict[str, str]]:
     return results, failed
 
 
-def _judge(case: EvalCase) -> list[str]:
+def _judge(case: EvalCase, provider: ModelProvider, news_source: NewsSource) -> list[str]:
     """Print one case in full and return its failure lines (empty when clean)."""
     print(f"{case.ticker} {case.on.isoformat()}  {case.what_happened}")
     with session_scope() as session:
@@ -215,34 +249,71 @@ def _judge(case: EvalCase) -> list[str]:
         if move is None:
             print("  no move stored on that date: it did not clear the move thresholds.")
             return [f"{case.ticker} {case.on.isoformat()}: no move on that date"]
-        explanation = get_explanation(session, move.id) if move.id is not None else None
-        cited = _cited_titles(session, explanation)
+        explanation = _explanation_for(session, move, provider, news_source)
+        cited = _cited_articles(session, explanation)
         return _report(case, move, explanation, cited)
+
+
+def _explanation_for(
+    session: Session,
+    move: Move,
+    provider: ModelProvider,
+    news_source: NewsSource,
+) -> Explanation | None:
+    """The stored explanation, written on demand if the ingest did not write it.
+
+    This is `api.tickers.read_move`'s own fallback, and deliberately the same
+    call with the same arguments: the ingest explains only the top-N moves by
+    `abs(ret_z)`, and two of the three eval days sit outside it, so without this
+    the citation half of the pass rule could never be judged at all. A failure
+    here is reported and swallowed — the routing verdicts do not depend on it,
+    and the citation verdict then fails on its own terms.
+    """
+    if move.id is None:
+        return None
+    explanation = get_explanation(session, move.id)
+    if explanation is not None:
+        return explanation
+    company = get_company(session, move.ticker)
+    if company is None:
+        print("  no company row: the ingest never stored this ticker.")
+        return None
+    print("  explaining on demand (the move is outside the ingest's top-N)...", flush=True)
+    try:
+        return enrich_move(session, move, company, provider, news_source)
+    except Exception as error:  # noqa: BLE001 - one bad explanation must not stop the run
+        print(f"  on-demand explanation raised {type(error).__name__}: {error}", flush=True)
+        return None
 
 
 def _report(
     case: EvalCase,
     move: Move,
     explanation: Explanation | None,
-    cited: list[str],
+    cited: list[tuple[str, str]],
 ) -> list[str]:
-    """Print the numbers, the prose and the two verdicts; return the failures."""
+    """Print the numbers, the prose and the three verdicts; return the failures."""
     print(f"  ret          {_pct(move.ret)}   ret_z {_num(move.ret_z)}")
     print(f"  macro_driver {move.macro_driver} ({_num(move.macro_driver_component)})")
     print(f"  rival_comove {_num(move.rival_comove)}   chain_comove {_num(move.chain_comove)}")
     if explanation is None:
-        print("  explanation  (none stored: the move is outside the explained top-N)")
+        print("  explanation  (none: not stored by the ingest and not written on demand)")
     else:
         print(f"  explanation  [{explanation.provider}] {explanation.summary}")
     if cited:
-        for title in cited:
-            print(f"    cited: {title}")
+        # The first three only: the lead citation is the one worth reading,
+        # and the order is the order the explanation cited them in.
+        for _, display in cited[:CITED_SHOWN]:
+            print(f"    cited: {display}")
+        if len(cited) > CITED_SHOWN:
+            print(f"    cited: (+{len(cited) - CITED_SHOWN} more)")
     else:
         print("    cited: (no articles cited)")
 
     failures: list[str] = []
     routing_ok = move.routing in case.expected_routing
     sub_ok = move.sub_routing in case.expected_sub_routing
+    matched = _matched_keyword(case.citation_keywords, cited)
     print(
         f"  routing      {move.routing}"
         f"  expected {_accepted(case.expected_routing)}  {_verdict(routing_ok)}"
@@ -250,6 +321,10 @@ def _report(
     print(
         f"  sub_routing  {move.sub_routing}"
         f"  expected {_accepted(case.expected_sub_routing)}  {_verdict(sub_ok)}"
+    )
+    print(
+        f"  citation     {matched if matched else 'none'}"
+        f"  expected {_accepted(case.citation_keywords)}  {_verdict(matched is not None)}"
     )
     where = f"{case.ticker} {case.on.isoformat()}"
     if not routing_ok:
@@ -261,22 +336,42 @@ def _report(
             f"{where}: sub_routing {move.sub_routing},"
             f" expected {_accepted(case.expected_sub_routing)}"
         )
+    if matched is None:
+        failures.append(
+            f"{where}: no cited title names the event,"
+            f" expected one of {_accepted(case.citation_keywords)}"
+        )
     return failures
 
 
-def _cited_titles(session: Session, explanation: Explanation | None) -> list[str]:
-    """The titles of the articles the explanation cited, in the order it cited them."""
+def _cited_articles(session: Session, explanation: Explanation | None) -> list[tuple[str, str]]:
+    """The articles the explanation cited, in the order it cited them.
+
+    Each entry is `(title, display)`: the bare title is what the keywords are
+    matched against, and the display line adds the source for the reader. A
+    citation whose row has gone has no title to match, only a line to print.
+    """
     if explanation is None:
         return []
-    titles: list[str] = []
+    cited: list[tuple[str, str]] = []
     for article_id in explanation.cited_article_ids:
         article = session.get(Article, article_id)
         if article is None:
-            titles.append(f"[{article_id}] (article row missing)")
+            cited.append(("", f"[{article_id}] (article row missing)"))
             continue
         source = f" ({article.source})" if article.source else ""
-        titles.append(f"{article.title}{source}")
-    return titles
+        cited.append((article.title, f"{article.title}{source}"))
+    return cited
+
+
+def _matched_keyword(keywords: tuple[str, ...], cited: list[tuple[str, str]]) -> str | None:
+    """The first keyword named by any cited title, or None if none of them is."""
+    for title, _ in cited:
+        lowered = title.lower()
+        for keyword in keywords:
+            if keyword.lower() in lowered:
+                return keyword
+    return None
 
 
 def _provider_used(results: list[IngestResult], configured: str) -> str:

@@ -640,10 +640,11 @@ def _seed_with_edges(session: Session) -> None:
 class RelationAskingProvider:
     """A provider that answers every turn with one `get_relations` call.
 
-    The same stand-in shape as `DateInventingProvider`: the heuristic router
-    never picks this tool (it has no keyword for it), so the only way to drive
-    the binding end to end through the real dependency graph is a fake model
-    that asks for it.
+    The same stand-in shape as `DateInventingProvider`. The heuristic router
+    reaches this tool too, but only ever with `{"ticker": ...}`; a fake model
+    is what drives the argument handling the bindings own -- an omitted
+    ticker, a ticker the question did not name, a phrase that must not become
+    a window.
     """
 
     name = "relation-asking"
@@ -766,35 +767,52 @@ def test_get_relations_without_a_ticker_anywhere_is_a_message_not_a_crash(
         tools["get_relations"]()
 
 
-def test_the_heuristic_renderer_survives_the_new_tool() -> None:
-    """The keyless renderer has no `get_relations` branch and does not need one
-    to stay up: its keyword router never selects the tool, and an unknown name
-    falls through to the news rendering, which finds no `articles` key and says
-    so. The follow-up — a branch that reads the edges out loud — belongs in
-    `providers/heuristic.py`, which this task does not own.
-    """
+def test_the_heuristic_renderer_reads_the_edges_out_loud() -> None:
+    """The keyless rendering of `get_relations`: the edge table said as
+    sentences, not the news fallback it used to land in."""
     payload = {
         "ticker": TICKER,
-        "edges": [{"dst": "AMD", "relation": "competitor", "weight": 0.8, "source": "model"}],
+        "edges": [
+            {"dst": "AMD", "relation": "competitor", "weight": 0.8, "source": "etf_holdings"},
+            {"dst": "TW", "relation": "country", "weight": 0.3, "source": "model"},
+        ],
     }
 
     rendered = HeuristicProvider()._render("get_relations", TICKER, {"ticker": TICKER}, payload)
 
-    assert isinstance(rendered, str)
-    assert rendered
+    assert "closest listed competitor on record is AMD" in rendered
+    assert "from the sector ETF's largest holdings" in rendered
+    assert "It is exposed to Taiwan (30%)" in rendered
+    assert "headlines" not in rendered
 
 
-def test_the_heuristic_router_never_picks_get_relations(client: TestClient) -> None:
-    """Every question the keyword router knows reaches one of the other three."""
-    for message in (
-        f"why did {TICKER} drop on {MOVE_DATE}?",
-        f"any news on {TICKER}",
-        f"biggest {TICKER} falls",
-        f"who competes with {TICKER}?",
+def test_the_heuristic_router_picks_get_relations_for_a_relations_question(
+    no_api_key: None,
+    frozen_today: None,
+) -> None:
+    """End to end and keyless: the question that used to come back as a wall of
+    moves now comes back as the edges, through the real tool binding."""
+    for test_client in _frozen_client(_seed_with_edges, None):
+        body = test_client.post(
+            "/chat", json={"message": f"Who does {TICKER} compete with?", "ticker": TICKER}
+        ).json()
+
+        assert [call["name"] for call in body["tool_calls"]] == ["get_relations"]
+        assert "closest listed competitor on record is AMD" in body["reply"]
+        assert "Its supplier on record is TSM" in body["reply"]
+
+
+def test_the_heuristic_router_still_reaches_the_other_three(client: TestClient) -> None:
+    """The relations branch sits between the news branch and the date branch,
+    so neither of those questions moved."""
+    for message, expected in (
+        (f"why did {TICKER} drop on {MOVE_DATE}?", "get_move"),
+        (f"any news on {TICKER}", "search_news"),
+        (f"news about {TICKER}'s competitors", "search_news"),
+        (f"biggest {TICKER} falls", "list_moves"),
     ):
         body = client.post("/chat", json={"message": message, "ticker": TICKER}).json()
-        names = {call["name"] for call in body["tool_calls"]}
-        assert "get_relations" not in names
+        assert [call["name"] for call in body["tool_calls"]] == [expected], message
 
 
 def test_moves_in_chat_carry_the_five_v15_keys(client: TestClient) -> None:
