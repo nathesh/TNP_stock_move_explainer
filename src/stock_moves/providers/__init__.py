@@ -25,6 +25,7 @@ from stock_moves.providers.base import (
     ExplanationResult,
     ModelProvider,
     MoveContext,
+    Relations,
     ToolCallRecord,
     ToolFn,
 )
@@ -41,6 +42,7 @@ __all__ = [
     "HeuristicProvider",
     "ModelProvider",
     "MoveContext",
+    "Relations",
     "ToolCallRecord",
     "ToolFn",
     "get_provider",

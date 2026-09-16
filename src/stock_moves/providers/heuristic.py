@@ -189,10 +189,27 @@ WEAK_ATTRIBUTION_NOTE = (
     "The matched headlines mention the company but do not name a specific "
     "event, so this attribution is weak."
 )
-"""Appended to the summary when no relevant headline names an event."""
+"""Appended to the summary when no cited headline names an event."""
 
 WEAK_ATTRIBUTION_PENALTY = 0.25
 WEAK_ATTRIBUTION_FLOOR = 0.2
+
+#: The ceiling on confidence when no cited headline names an event. Matching
+#: the company is not evidence of a cause: "Can TEST stock reach $350?" is
+#: commentary, and an explanation built on nothing else may not read as more
+#: than a guess. Sits *under* the penalty above, not instead of it.
+NO_EVENT_CONFIDENCE_CAP = 0.45
+
+#: The ceiling when at least one cited headline does name an event. Lower than
+#: the old 0.9: a keyword match on a title, with no body text read, is never
+#: near-certain evidence.
+EVENT_CONFIDENCE_CAP = 0.85
+
+#: Added per cited headline that names an event. Headlines that match only the
+#: entity add nothing here -- their contribution to the move is already the
+#: relevance stored on `move_articles`, and counting them again as confidence
+#: is what let generic bullish commentary reach 0.85.
+EVENT_HEADLINE_CREDIT = 0.15
 
 
 def _normalise(text: str) -> str:
@@ -214,6 +231,16 @@ def _names_an_event(title: str) -> bool:
     """True when the title contains an `EVENT_TERMS` word as a whole word."""
     normalised = _normalise(title)
     return any(_has_word(normalised, term) for term in EVENT_TERMS)
+
+
+def _event_headline_sentence(article: ArticleInput) -> str:
+    """One sentence naming the cited headline that carried the event.
+
+    The confidence now rests on this headline and no other, so the reader is
+    told which one it is rather than being handed a number to trust.
+    """
+    source = f" ({article.source})" if article.source else ""
+    return f"The event comes from \u201c{article.title}\u201d{source}."
 
 
 def _company_name_forms(name: str) -> tuple[str, ...]:
@@ -399,19 +426,28 @@ class HeuristicProvider:
         total = sum(abs(value) for value in present)
         share = (max(abs(value) for value in present) / total) if present and total > 0 else 0.0
 
-        confidence = min(
-            0.9,
+        # Only headlines that name an event earn confidence. A headline that
+        # merely matches the company is coverage, not evidence: its worth is
+        # the relevance already stored against the move, and counting it here
+        # as well is what let a day of generic bullish commentary score 0.85.
+        event_articles = [article for article, _ in cited if _names_an_event(article.title)]
+        confidence = (
             0.3
-            + 0.15 * min(len(relevant), 3)
+            + EVENT_HEADLINE_CREDIT * len(event_articles)
             + 0.2 * float(move.near_earnings)
-            + 0.1 * float(share >= 0.6),
+            + 0.1 * float(share >= 0.6)
         )
-        # Matching headlines that name no event are coverage, not evidence:
-        # they should not buy the same confidence as "cuts guidance". Only
-        # checked when there *are* matched headlines to judge.
-        if relevant and not any(_names_an_event(article.title) for article, _ in relevant):
-            confidence = max(WEAK_ATTRIBUTION_FLOOR, confidence - WEAK_ATTRIBUTION_PENALTY)
-            sentences.append(WEAK_ATTRIBUTION_NOTE)
+        if event_articles:
+            confidence = min(EVENT_CONFIDENCE_CAP, confidence)
+            sentences.append(_event_headline_sentence(event_articles[0]))
+        else:
+            # No cited headline names an event, so the penalty applies and the
+            # result is held under the cap however well the decomposition and
+            # the earnings window score on their own.
+            if relevant:
+                confidence = max(WEAK_ATTRIBUTION_FLOOR, confidence - WEAK_ATTRIBUTION_PENALTY)
+                sentences.append(WEAK_ATTRIBUTION_NOTE)
+            confidence = min(NO_EVENT_CONFIDENCE_CAP, confidence)
 
         return ExplanationResult(
             summary=" ".join(sentences),

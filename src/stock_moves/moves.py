@@ -26,7 +26,12 @@ from .macro_calendar import CPI_DATES, FOMC_DATES
 __all__ = [
     "FACTOR_COLUMNS",
     "FEATURE_COLUMNS",
+    "MIN_RIVALS",
     "OHLCV_COLUMNS",
+    "SHARE_SHIFT_RATIO",
+    "SUB_ROUTE_SHARE_SHIFT",
+    "SUB_ROUTE_SUPPLY_CHAIN",
+    "SUPPLY_CHAIN_RATIO",
     "build_features",
     "compute_returns",
     "decompose",
@@ -39,6 +44,8 @@ __all__ = [
     "regime",
     "rolling_z",
     "route",
+    "signed_comove",
+    "sub_route",
     "volume_z",
 ]
 
@@ -75,6 +82,26 @@ FACTOR_COLUMNS: tuple[str, ...] = ("macro_driver", "macro_driver_component")
 #: trailing standard deviations from flat (v1.5 plan, decision 4). Without the
 #: gate a large beta would nominate a driver out of an ordinary day's noise.
 MACRO_DRIVER_Z_MIN = 1.5
+
+#: Sub-routing thresholds (v1.5 plan, decision 6), both expressed as a fraction
+#: of the move's own size so they scale with the day: a 1% fall needs rivals up
+#: 0.25% to read as a share shift, a 10% fall needs them up 2.5%. The supply
+#: chain bar is the higher of the two because "everyone in the chain fell
+#: together" is a weaker claim than "the money went to a rival" and should not
+#: be made on a sympathetic twitch.
+SHARE_SHIFT_RATIO: float = 0.25
+SUPPLY_CHAIN_RATIO: float = 0.5
+
+#: How many related names must have traded that day before their mean return is
+#: usable at all. One name moving is an anecdote; two is the smallest thing that
+#: can be called a co-movement.
+MIN_RIVALS: int = 2
+
+#: The two company-side sub-buckets. The macro-side ones are not constants here:
+#: they are whatever :func:`macro_driver` named (``oil``, ``dollar``, ``rates``,
+#: ``gold``, ``country:XX``), passed through verbatim.
+SUB_ROUTE_SHARE_SHIFT: str = "share_shift"
+SUB_ROUTE_SUPPLY_CHAIN: str = "supply_chain"
 
 _ROUTE_COMPANY = "company"
 _ROUTE_INDUSTRY = "industry"
@@ -286,6 +313,24 @@ def near_earnings(
     return near_dates(index, earnings_dates, tolerance=tolerance)
 
 
+def _mean_comove(
+    returns: pd.DataFrame | None,
+    dates: pd.DatetimeIndex,
+    min_count: int,
+) -> pd.Series:
+    """Mean across ``returns``' columns per date, NaN below ``min_count`` reporters.
+
+    The one arithmetic shared by :func:`peer_comove` and :func:`signed_comove`.
+    At ``min_count=1`` the mask is a no-op — a date where nothing reported is
+    already NaN — which is why the older function can sit on top of it unchanged.
+    """
+    if returns is None or returns.shape[1] == 0:
+        return pd.Series(np.nan, index=dates, dtype=float)
+    aligned = returns.reindex(dates)
+    mean = aligned.mean(axis=1, skipna=True).astype(float)
+    return mean.where(aligned.count(axis=1) >= min_count)
+
+
 def peer_comove(peer_returns: pd.DataFrame, dates: pd.DatetimeIndex) -> pd.Series:
     """Mean same-day peer return, the second and independent industry signal.
 
@@ -293,10 +338,26 @@ def peer_comove(peer_returns: pd.DataFrame, dates: pd.DatetimeIndex) -> pd.Serie
     missing peers; a date with no peer data at all is NaN, as is every date when
     there are no peers.
     """
-    if peer_returns is None or peer_returns.shape[1] == 0:
-        return pd.Series(np.nan, index=dates, dtype=float)
-    aligned = peer_returns.reindex(dates)
-    return aligned.mean(axis=1, skipna=True).astype(float)
+    return _mean_comove(peer_returns, dates, min_count=1)
+
+
+def signed_comove(
+    other_returns: pd.DataFrame,
+    dates: pd.DatetimeIndex,
+    min_count: int = MIN_RIVALS,
+) -> pd.Series:
+    """Mean same-day return across a set of related names, or NaN if too thin.
+
+    The average :func:`peer_comove` computes, with one rule added: a date where
+    fewer than ``min_count`` columns reported is NaN rather than the mean of
+    whatever did. :func:`sub_route` turns this number into a claim — *the money
+    went to a rival*, *the whole chain fell* — and a claim of that shape should
+    not rest on one name that happened to trade.
+
+    The sign is kept, hence the name: the caller needs the direction relative to
+    the stock, not the size of the co-movement.
+    """
+    return _mean_comove(other_returns, dates, min_count=min_count)
 
 
 def factor_betas(
@@ -401,6 +462,73 @@ def macro_driver(
         },
         index=index,
     )
+
+
+def _finite_or_none(value: float | None) -> float | None:
+    """``value`` as a float, or None when it is missing, non-numeric or not finite."""
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def sub_route(
+    routing: str,
+    ret: float,
+    rival_comove: float | None,
+    chain_comove: float | None,
+    macro_driver: str | None,
+) -> str | None:
+    """Name the sub-bucket of one move, or None (v1.5 plan, decision 6).
+
+    ``routing`` keeps its three v1 buckets; this is the finer label stored
+    beside it, and it is only ever a refinement — never a contradiction — of
+    the bucket :func:`route` already chose.
+
+    * ``company`` and rivals moved *against* the stock by at least
+      :data:`SHARE_SHIFT_RATIO` of the move → ``share_shift``. The tape is
+      saying the money went somewhere specific.
+    * ``company`` and suppliers or customers moved *with* the stock by at least
+      :data:`SUPPLY_CHAIN_RATIO` of the move → ``supply_chain``. The story is
+      the chain the company sits in.
+    * ``macro`` and :func:`macro_driver` named something → that name verbatim
+      (``oil``, ``dollar``, ``rates``, ``gold``, ``country:XX``).
+    * anything else → None. ``industry`` in particular has no sub-bucket: the
+      sector was the answer, and there is nothing finer to say.
+
+    ``share_shift`` wins when both company rules hold. A rival moving the other
+    way is the more specific and the more falsifiable claim of the two, so it is
+    the one worth printing.
+
+    Pure, and deliberately unforgiving about missing inputs: None, NaN and a
+    non-finite ``comove`` all mean "no signal", not "no effect". A ``ret`` of
+    zero or NaN is treated the same way, because at ``ret == 0`` both company
+    tests reduce to ``0 <= 0`` and would fire on any rivals at all — a rule
+    carrying no information should not be allowed to produce a label.
+    """
+    if routing == _ROUTE_MACRO:
+        return macro_driver if isinstance(macro_driver, str) and macro_driver else None
+    if routing != _ROUTE_COMPANY:
+        return None
+
+    move = _finite_or_none(ret)
+    if move is None or move == 0.0:
+        return None
+    sign = 1.0 if move > 0.0 else -1.0
+    size = abs(move)
+
+    rival = _finite_or_none(rival_comove)
+    if rival is not None and rival * sign <= -SHARE_SHIFT_RATIO * size:
+        return SUB_ROUTE_SHARE_SHIFT
+
+    chain = _finite_or_none(chain_comove)
+    if chain is not None and chain * sign >= SUPPLY_CHAIN_RATIO * size:
+        return SUB_ROUTE_SUPPLY_CHAIN
+
+    return None
 
 
 def build_features(

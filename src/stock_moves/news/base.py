@@ -18,6 +18,7 @@ from typing import Protocol
 
 __all__ = [
     "MACRO_QUERY_TERMS",
+    "MAX_EXTRA_QUERIES",
     "NewsItem",
     "NewsSource",
     "build_query",
@@ -56,6 +57,11 @@ class NewsSource(Protocol):
         ...
 
 
+# `geo` imports `NewsSource` from this module, so the import cannot sit at the
+# top of the file: it is placed here, immediately after the name `geo` needs,
+# which makes the cycle resolve whichever of the two modules is imported first.
+from . import geo
+
 # The fixed macro vocabulary of DESIGN §3. Deliberately duplicated as
 # `MACRO_TERMS` in `providers/base.py` so wave-1 modules import nothing from
 # each other.
@@ -90,6 +96,17 @@ _NAME_SUFFIXES: frozenset[str] = frozenset(
 )
 
 _VALID_BUCKETS: tuple[str, ...] = ("company", "industry", "macro")
+
+MAX_EXTRA_QUERIES: int = 3
+"""Cap on the edge-expanded queries added to a move (v1.5 plan, decision 8).
+
+Three is the plan's number and it is a cost control, not a tuning knob: a move
+already costs two searches, and a company with a dozen competitors would
+otherwise turn one move into a dozen round-trips against a throttled source.
+"""
+
+# The `sub_routing` prefix that carries an ISO-3166 alpha-2 code (`country:TW`).
+_COUNTRY_SUB_ROUTING_PREFIX: str = "country:"
 
 
 def clean_company_name(name: str) -> str:
@@ -164,19 +181,14 @@ def build_query(
     return f"({terms}) stock market"
 
 
-def queries_for_move(
+def _v1_queries(
     routing: str,
     company_name: str,
     ticker: str,
-    peers: Sequence[str] = (),
-    industry: str | None = None,
+    peers: Sequence[str],
+    industry: str | None,
 ) -> list[tuple[str, str]]:
-    """Return `[(bucket, query)]` for a move: the company baseline, plus its bucket.
-
-    The company query always runs, so even a macro-routed move is checked for
-    company-specific news. An `industry` routing with no peers and no industry
-    term falls back to the company query alone.
-    """
+    """The v1 queries for a move: the company baseline, plus its routing bucket."""
     queries: list[tuple[str, str]] = [
         ("company", build_query("company", company_name, ticker, peers, industry))
     ]
@@ -193,6 +205,91 @@ def queries_for_move(
             return queries
     elif routing == "macro":
         queries.append(("macro", build_query("macro", company_name, ticker, peers, industry)))
+
+    return queries
+
+
+def _name_query(name: str) -> str | None:
+    """`'"<clean name>" stock'`, or `None` if the name is blank once cleaned."""
+    cleaned = clean_company_name(name or "")
+    return f'"{cleaned}" stock' if cleaned else None
+
+
+def _edge_queries(
+    sub_routing: str | None,
+    rival_names: Sequence[str],
+    chain_names: Sequence[str],
+    country: str | None,
+) -> list[tuple[str, str]]:
+    """The candidate edge queries for a `sub_routing`, before cap and dedupe.
+
+    One branch each, matching v1.5 plan decision 8: a competitor that moved the
+    other way, a supplier or customer that moved with the stock, or the
+    country's geopolitical query. A `sub_routing` with no edge story
+    (`oil`, `rates`, `None`, ...) contributes nothing.
+    """
+    if not sub_routing:
+        return []
+
+    if sub_routing == "share_shift":
+        names: Sequence[str] = rival_names
+    elif sub_routing == "supply_chain":
+        names = chain_names
+    elif sub_routing.startswith(_COUNTRY_SUB_ROUTING_PREFIX):
+        # The explicit `country` wins when a caller has the code to hand; the
+        # rest of the `sub_routing` string is the fallback.
+        code = (country or sub_routing[len(_COUNTRY_SUB_ROUTING_PREFIX) :]).strip()
+        try:
+            return [("macro", geo.geo_query(code))]
+        # An unknown or empty code is a company edge we have no query for. The
+        # move still gets its v1 queries; it just gets no geo expansion.
+        except ValueError:
+            return []
+    else:
+        return []
+
+    candidates = (_name_query(name) for name in names)
+    return [("company", query) for query in candidates if query is not None]
+
+
+def queries_for_move(
+    routing: str,
+    company_name: str,
+    ticker: str,
+    peers: Sequence[str] = (),
+    industry: str | None = None,
+    *,
+    sub_routing: str | None = None,
+    rival_names: Sequence[str] = (),
+    chain_names: Sequence[str] = (),
+    country: str | None = None,
+) -> list[tuple[str, str]]:
+    """Return `[(bucket, query)]` for a move: the company baseline, plus its bucket.
+
+    The company query always runs, so even a macro-routed move is checked for
+    company-specific news. An `industry` routing with no peers and no industry
+    term falls back to the company query alone.
+
+    The keyword-only arguments are the v1.5 edge expansion (plan decision 8).
+    They are all optional and default to nothing, so a v1 call returns exactly
+    the v1 list. When they are supplied, the v1 queries still come first and
+    are never altered; at most `MAX_EXTRA_QUERIES` queries are appended, and a
+    query that repeats one already in the list — a rival whose cleaned name is
+    the company's own, or the same name reached down two edges — is dropped
+    rather than fetched twice.
+    """
+    queries = _v1_queries(routing, company_name, ticker, peers, industry)
+
+    seen: set[str] = {query for _, query in queries}
+    added = 0
+    for bucket, query in _edge_queries(sub_routing, rival_names, chain_names, country):
+        if added == MAX_EXTRA_QUERIES:
+            break
+        if query in seen:
+            continue
+        seen.add(query)
+        queries.append((bucket, query))
+        added += 1
 
     return queries
 

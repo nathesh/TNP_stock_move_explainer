@@ -16,7 +16,11 @@ from stock_moves.providers.base import (
     MoveContext,
     ToolFn,
 )
-from stock_moves.providers.heuristic import HeuristicProvider
+from stock_moves.providers.heuristic import (
+    EVENT_CONFIDENCE_CAP,
+    NO_EVENT_CONFIDENCE_CAP,
+    HeuristicProvider,
+)
 
 PROVIDER = HeuristicProvider()
 
@@ -186,7 +190,8 @@ def test_an_extreme_move_is_explained_even_with_no_headlines() -> None:
 
 def test_explain_routes_cites_at_most_three_and_caps_confidence() -> None:
     # Each headline names an event ("cuts guidance"), so the confidence is the
-    # ungrounded-headline check's pass case and reaches the 0.9 cap.
+    # event check's pass case and reaches the 0.85 cap -- not 1.05, and not the
+    # old 0.9: a keyword match on a title is never near-certain evidence.
     articles = [art(i, f"Testco Industries cuts guidance, headline {i}") for i in range(1, 5)]
     scored = [(a, ArticleScore(a.id, 1.0, "company")) for a in articles]
     result = PROVIDER.explain(ctx(near_earnings=True), scored)
@@ -194,7 +199,7 @@ def test_explain_routes_cites_at_most_three_and_caps_confidence() -> None:
     assert result.unexplained is False
     assert result.primary_category == "company"
     assert result.cited_article_ids == (1, 2, 3)
-    assert result.confidence == 0.9
+    assert result.confidence == EVENT_CONFIDENCE_CAP == 0.85
     assert "was down 5.0%" in result.summary
     # The size as a multiple of an ordinary day, and the decomposition as a
     # share of the move -- not a z-score and not percentage points.
@@ -249,12 +254,78 @@ def test_generic_commentary_headlines_lower_the_confidence() -> None:
     scored = [(art(i, title), ArticleScore(i, 0.9, "company")) for i, title in enumerate(titles, 1)]
     result = PROVIDER.explain(ctx(), scored)
 
-    # 0.3 + 0.15*2 + 0.1 dominance = 0.7, less the 0.25 ungrounded penalty.
-    assert result.confidence == 0.45
+    # The two entity-only headlines buy nothing: 0.3 + 0.1 dominance = 0.4,
+    # less the 0.25 penalty, floored at 0.2 -- and under the 0.45 cap.
+    assert result.confidence == 0.2
+    assert result.confidence <= NO_EVENT_CONFIDENCE_CAP
     assert (
         "The matched headlines mention the company but do not name a specific "
         "event, so this attribution is weak."
     ) in result.summary
+    assert "The event comes from" not in result.summary
+
+
+def test_entity_only_headlines_are_capped_even_with_every_other_bonus() -> None:
+    """The 2026-01-20 AAPL defect: generic bullish commentary scored 0.85.
+
+    Three matching headlines, an earnings window and a dominant component used
+    to reach the old 0.9 ceiling on entity matches alone. The cap is the part
+    the penalty could not do by itself -- a strong decomposition must not buy
+    confidence that no headline supports.
+    """
+    titles = (
+        "Is Testco Industries stock a buy right now?",
+        "Testco Industries: 3 reasons to stay bullish",
+        "Where will Testco Industries be in 5 years?",
+    )
+    scored = [(art(i, t), ArticleScore(i, 1.0, "company")) for i, t in enumerate(titles, 1)]
+    result = PROVIDER.explain(ctx(near_earnings=True), scored)
+
+    assert result.confidence <= NO_EVENT_CONFIDENCE_CAP
+    assert result.cited_article_ids == (1, 2, 3)
+    assert "attribution is weak" in result.summary
+
+
+def test_one_event_headline_lifts_the_same_set_and_is_named() -> None:
+    """The same commentary plus one headline that names an event.
+
+    Above the no-event cap, citing the event article, and saying in the summary
+    which headline carried it -- so the reader can check the grounding rather
+    than trust the number.
+    """
+    titles = (
+        "Is Testco Industries stock a buy right now?",
+        "Testco Industries cuts guidance for the year",
+        "Where will Testco Industries be in 5 years?",
+    )
+    scored = [(art(i, t), ArticleScore(i, 1.0, "company")) for i, t in enumerate(titles, 1)]
+    result = PROVIDER.explain(ctx(near_earnings=True), scored)
+
+    assert result.confidence > NO_EVENT_CONFIDENCE_CAP
+    assert result.confidence <= EVENT_CONFIDENCE_CAP
+    assert 2 in result.cited_article_ids
+    assert "Testco Industries cuts guidance for the year" in result.summary
+    assert "The event comes from" in result.summary
+    assert "attribution is weak" not in result.summary
+    assert_no_jargon(result.summary)
+
+
+def test_entity_only_headlines_add_nothing_beside_an_event_headline() -> None:
+    """Two extra commentary headlines must not raise the confidence.
+
+    Only the headline that names an event is credited, so the pair below score
+    exactly as the event headline does alone.
+    """
+    event = (art(1, "Testco Industries cuts guidance"), ArticleScore(1, 1.0, "company"))
+    padding = [
+        (art(2, "Can TEST stock reach $350?"), ArticleScore(2, 1.0, "company")),
+        (art(3, "How to play TEST shares"), ArticleScore(3, 1.0, "company")),
+    ]
+
+    alone = PROVIDER.explain(ctx(), [event])
+    padded = PROVIDER.explain(ctx(), [event, *padding])
+
+    assert padded.confidence == alone.confidence
 
 
 def test_suggest_peers_is_empty_without_a_key() -> None:

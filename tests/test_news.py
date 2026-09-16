@@ -22,6 +22,8 @@ from stock_moves.news import (
     window_for,
 )
 from stock_moves.news import gdelt as gdelt_module
+from stock_moves.news.base import MAX_EXTRA_QUERIES
+from stock_moves.news.geo import geo_query
 
 RSS_FIXTURE = """<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0">
@@ -171,6 +173,177 @@ def test_queries_for_move_adds_the_bucket_query(routing: str) -> None:
 def test_queries_for_move_industry_without_peers_falls_back_to_company() -> None:
     assert queries_for_move("industry", "", "", peers=[], industry=None) == [
         ("company", '"" stock')
+    ]
+
+
+# --- queries_for_move: the v1.5 edge expansion (plan decision 8) -------------
+
+
+@pytest.mark.parametrize("routing", ["company", "industry", "macro"])
+def test_queries_for_move_without_new_kwargs_is_exactly_the_v1_list(routing: str) -> None:
+    """The v1 call is untouched: same list, no extras, for every routing."""
+    args = ("NVIDIA Corporation", "NVDA", ["AMD"], "Semiconductors")
+    assert queries_for_move(routing, *args) == queries_for_move(
+        routing,
+        *args,
+        sub_routing=None,
+        rival_names=(),
+        chain_names=(),
+        country=None,
+    )
+
+
+def test_queries_for_move_share_shift_adds_one_query_per_rival() -> None:
+    queries = queries_for_move(
+        "company",
+        "NVIDIA Corporation",
+        "NVDA",
+        ["AMD"],
+        "Semiconductors",
+        sub_routing="share_shift",
+        rival_names=["Advanced Micro Devices, Inc.", "Intel Corporation"],
+    )
+    assert queries == [
+        ("company", '"NVIDIA" stock OR NVDA'),
+        ("company", '"Advanced Micro Devices" stock'),
+        ("company", '"Intel" stock'),
+    ]
+
+
+def test_queries_for_move_share_shift_ignores_chain_names() -> None:
+    queries = queries_for_move(
+        "company",
+        "NVIDIA Corporation",
+        "NVDA",
+        sub_routing="share_shift",
+        rival_names=["Intel Corp"],
+        chain_names=["Taiwan Semiconductor Manufacturing Company"],
+    )
+    assert queries[1:] == [("company", '"Intel" stock')]
+
+
+def test_queries_for_move_supply_chain_adds_one_query_per_chain_name() -> None:
+    queries = queries_for_move(
+        "company",
+        "Apple Inc.",
+        "AAPL",
+        sub_routing="supply_chain",
+        rival_names=["Samsung Electronics Co."],
+        chain_names=["Taiwan Semiconductor Manufacturing Company", "Foxconn Holdings"],
+    )
+    assert queries == [
+        ("company", '"Apple" stock OR AAPL'),
+        ("company", '"Taiwan Semiconductor Manufacturing" stock'),
+        ("company", '"Foxconn" stock'),
+    ]
+
+
+def test_queries_for_move_blank_edge_names_are_skipped() -> None:
+    queries = queries_for_move(
+        "company",
+        "Apple Inc.",
+        "AAPL",
+        sub_routing="share_shift",
+        rival_names=["", "   ", "Dell Technologies Inc."],
+    )
+    assert queries[1:] == [("company", '"Dell Technologies" stock')]
+
+
+def test_queries_for_move_country_sub_routing_adds_the_geo_query() -> None:
+    queries = queries_for_move(
+        "macro",
+        "Apple Inc.",
+        "AAPL",
+        sub_routing="country:TW",
+    )
+    assert queries[-1] == ("macro", geo_query("TW"))
+    assert len(queries) == 3
+
+
+def test_queries_for_move_explicit_country_overrides_the_sub_routing_code() -> None:
+    queries = queries_for_move(
+        "macro",
+        "Apple Inc.",
+        "AAPL",
+        sub_routing="country:TW",
+        country="CN",
+    )
+    assert queries[-1] == ("macro", geo_query("CN"))
+
+
+def test_queries_for_move_unknown_country_is_skipped_not_raised() -> None:
+    """An edge to a country with no query is a missing expansion, not a failure."""
+    v1 = queries_for_move("macro", "Apple Inc.", "AAPL")
+    assert queries_for_move("macro", "Apple Inc.", "AAPL", sub_routing="country:ZZ") == v1
+    assert queries_for_move("macro", "Apple Inc.", "AAPL", sub_routing="country:") == v1
+    assert (
+        queries_for_move("macro", "Apple Inc.", "AAPL", sub_routing="country:TW", country="ZZ")
+        == v1
+    )
+
+
+@pytest.mark.parametrize("sub_routing", [None, "oil", "dollar", "rates", "gold"])
+def test_queries_for_move_sub_routing_without_an_edge_story_adds_nothing(
+    sub_routing: str | None,
+) -> None:
+    v1 = queries_for_move("macro", "Apple Inc.", "AAPL")
+    assert (
+        queries_for_move(
+            "macro",
+            "Apple Inc.",
+            "AAPL",
+            sub_routing=sub_routing,
+            rival_names=["Dell Technologies"],
+            chain_names=["Foxconn"],
+        )
+        == v1
+    )
+
+
+def test_queries_for_move_caps_the_extra_queries() -> None:
+    queries = queries_for_move(
+        "company",
+        "NVIDIA Corporation",
+        "NVDA",
+        sub_routing="share_shift",
+        rival_names=["AMD", "Intel", "Qualcomm", "Broadcom", "Marvell"],
+    )
+    assert len(queries) == 1 + MAX_EXTRA_QUERIES
+    assert [query for _, query in queries[1:]] == [
+        '"AMD" stock',
+        '"Intel" stock',
+        '"Qualcomm" stock',
+    ]
+
+
+def test_queries_for_move_dedupes_an_extra_against_the_v1_queries() -> None:
+    """A rival whose cleaned name is the company's own is not fetched twice."""
+    queries = queries_for_move(
+        "company",
+        "Ford Motor Company",
+        "F",
+        sub_routing="share_shift",
+        rival_names=["Ford Motor Co.", "General Motors Company"],
+    )
+    assert queries == [
+        ("company", '"Ford Motor" stock'),
+        ("company", '"General Motors" stock'),
+    ]
+
+
+def test_queries_for_move_dedupes_the_extras_against_each_other() -> None:
+    """The same name down two edges, and two spellings of it, cost one query."""
+    queries = queries_for_move(
+        "company",
+        "Apple Inc.",
+        "AAPL",
+        sub_routing="supply_chain",
+        chain_names=["Foxconn", "Foxconn Holdings", "Foxconn", "Qualcomm Inc"],
+    )
+    assert queries == [
+        ("company", '"Apple" stock OR AAPL'),
+        ("company", '"Foxconn" stock'),
+        ("company", '"Qualcomm" stock'),
     ]
 
 

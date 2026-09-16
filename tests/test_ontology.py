@@ -9,9 +9,19 @@ from sqlmodel import select
 
 from stock_moves import ontology, prices
 from stock_moves.db import Session
-from stock_moves.models import Company
-from stock_moves.ontology import get_or_build_company, peers_of, upsert_company
+from stock_moves.models import Company, CompanyEdge
+from stock_moves.ontology import (
+    build_edges,
+    country_codes,
+    edges_of,
+    edges_to_dicts,
+    get_or_build_company,
+    peers_of,
+    relation_tickers,
+    upsert_company,
+)
 from stock_moves.prices import TickerInfo
+from stock_moves.providers import Relations
 
 INFO = TickerInfo(
     ticker="TEST",
@@ -27,16 +37,26 @@ HOLDINGS = ["ETF1", "TEST", "etf2"]
 
 
 class _StubProvider:
-    """A provider that only answers `suggest_peers` — the one method this
-    module calls. `raises` makes the call fail, which must route to the ETF
-    fallback rather than fail the build."""
+    """A provider that answers `suggest_peers` and `suggest_relations` — the two
+    methods this module calls. `raises` makes both calls fail, which must route
+    to the ETF fallback rather than fail the build."""
 
     name = "stub"
 
-    def __init__(self, peers: list[str] | None = None, *, raises: bool = False) -> None:
+    def __init__(
+        self,
+        peers: list[str] | None = None,
+        *,
+        raises: bool = False,
+        relations: Relations | None = None,
+    ) -> None:
         self._peers = peers or []
         self._raises = raises
+        self._relations = relations or Relations(
+            competitors=(), suppliers=(), customers=(), countries=()
+        )
         self.calls = 0
+        self.relation_calls = 0
 
     def suggest_peers(
         self, ticker: str, name: str, sector: str | None, industry: str | None
@@ -45,6 +65,35 @@ class _StubProvider:
         if self._raises:
             raise RuntimeError("model unavailable")
         return list(self._peers)
+
+    def suggest_relations(
+        self, ticker: str, name: str, sector: str | None, industry: str | None
+    ) -> Relations:
+        self.relation_calls += 1
+        if self._raises:
+            raise RuntimeError("model unavailable")
+        return self._relations
+
+
+MODEL_RELATIONS = Relations(
+    competitors=("amd", "INTC"),
+    suppliers=("TSM",),
+    customers=("MSFT",),
+    countries=(("tw", 0.4), ("CN", 0.25)),
+)
+
+
+def _company(session: Session, peers: list[str] | None = None) -> Company:
+    """A stored `companies` row with `peers` as its ETF-sourced peer list."""
+    return upsert_company(session, INFO, peers or [], "etf_holdings")
+
+
+def _rows(session: Session, relation: str | None = None) -> list[tuple[str, str, float, str]]:
+    """Stored edges as comparable tuples, in `edges_of` order."""
+    return [
+        (edge.relation, edge.dst, edge.weight, edge.source)
+        for edge in edges_of(session, "TEST", relation)
+    ]
 
 
 def _patch_prices(
@@ -194,3 +243,168 @@ def test_peers_of(session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert peers_of(company) == ["AAA", "BBB"]
     assert peers_of(Company(ticker="X", name="X")) == []
+
+
+# --------------------------------------------------------------------------- #
+# build_edges
+# --------------------------------------------------------------------------- #
+
+
+def test_build_edges_writes_typed_model_edges(session: Session) -> None:
+    company = _company(session, ["OLD1"])
+    provider = _StubProvider(relations=MODEL_RELATIONS)
+
+    edges = build_edges(session, company, provider)
+
+    assert provider.relation_calls == 1
+    # The model named competitors, so the stored peer list is not consulted.
+    assert _rows(session) == [
+        ("competitor", "AMD", 1.0, "model"),
+        ("competitor", "INTC", 1.0, "model"),
+        ("country", "CN", 0.25, "model"),
+        ("country", "TW", 0.4, "model"),
+        ("customer", "MSFT", 1.0, "model"),
+        ("supplier", "TSM", 1.0, "model"),
+    ]
+    assert {(edge.relation, edge.dst) for edge in edges} == {
+        ("competitor", "AMD"),
+        ("competitor", "INTC"),
+        ("country", "CN"),
+        ("country", "TW"),
+        ("customer", "MSFT"),
+        ("supplier", "TSM"),
+    }
+    assert all(edge.src == "TEST" for edge in edges)
+
+
+def test_build_edges_falls_back_to_etf_competitors(session: Session) -> None:
+    company = _company(session, ["ETF1", "ETF2"])
+
+    build_edges(session, company, _StubProvider())
+
+    assert _rows(session) == [
+        ("competitor", "ETF1", 1.0, "etf_holdings"),
+        ("competitor", "ETF2", 1.0, "etf_holdings"),
+    ]
+    # An empty model answer means no supplier, customer or country edges at
+    # all: without a key the geopolitical gate can never open.
+    assert country_codes(session, "TEST") == []
+
+
+def test_build_edges_survives_a_failing_provider(session: Session) -> None:
+    company = _company(session, ["ETF1"])
+
+    build_edges(session, company, _StubProvider(raises=True))
+
+    assert _rows(session) == [("competitor", "ETF1", 1.0, "etf_holdings")]
+
+
+def test_build_edges_replaces_rather_than_duplicates(session: Session) -> None:
+    company = _company(session, ["ETF1"])
+    provider = _StubProvider(relations=MODEL_RELATIONS)
+
+    build_edges(session, company, provider)
+    build_edges(session, company, provider)
+
+    assert len(session.exec(select(CompanyEdge)).all()) == 6
+    assert _rows(session, "competitor") == [
+        ("competitor", "AMD", 1.0, "model"),
+        ("competitor", "INTC", 1.0, "model"),
+    ]
+
+    # A later, different answer replaces the earlier one instead of unioning.
+    narrowed = _StubProvider(
+        relations=Relations(
+            competitors=("AVGO",), suppliers=(), customers=(), countries=(("JP", 0.1),)
+        )
+    )
+    build_edges(session, company, narrowed)
+
+    assert _rows(session) == [
+        ("competitor", "AVGO", 1.0, "model"),
+        ("country", "JP", 0.1, "model"),
+    ]
+
+
+def test_build_edges_writes_factor_edges_from_betas(session: Session) -> None:
+    company = _company(session)
+
+    build_edges(session, company, _StubProvider(), {"oil": 0.8, "country:TW": -0.25})
+
+    assert _rows(session, "factor") == [
+        ("factor", "country:TW", -0.25, "prices"),
+        ("factor", "oil", 0.8, "prices"),
+    ]
+
+
+def test_factor_betas_none_leaves_factor_rows_untouched(session: Session) -> None:
+    company = _company(session)
+    build_edges(session, company, _StubProvider(), {"oil": 0.8})
+
+    # No betas this time: prices had nothing to say, so the fitted rows stand.
+    build_edges(session, company, _StubProvider(relations=MODEL_RELATIONS))
+
+    assert _rows(session, "factor") == [("factor", "oil", 0.8, "prices")]
+
+    # Betas handed in replace them; an empty mapping clears them.
+    build_edges(session, company, _StubProvider(), {"gold": 0.1})
+    assert _rows(session, "factor") == [("factor", "gold", 0.1, "prices")]
+
+    build_edges(session, company, _StubProvider(), {})
+    assert _rows(session, "factor") == []
+
+
+# --------------------------------------------------------------------------- #
+# The reads
+# --------------------------------------------------------------------------- #
+
+
+def test_edges_of_filters_by_relation(session: Session) -> None:
+    company = _company(session)
+    build_edges(session, company, _StubProvider(relations=MODEL_RELATIONS), {"oil": 0.5})
+
+    assert [edge.dst for edge in edges_of(session, "TEST", "competitor")] == ["AMD", "INTC"]
+    assert [edge.dst for edge in edges_of(session, "TEST", "supplier")] == ["TSM"]
+    assert [edge.dst for edge in edges_of(session, "TEST", "factor")] == ["oil"]
+    assert len(edges_of(session, "TEST")) == 7
+    assert edges_of(session, "OTHER") == []
+    # Lower case in, same edges out.
+    assert len(edges_of(session, "test")) == 7
+
+
+def test_relation_tickers_are_sorted_and_upper_case(session: Session) -> None:
+    company = _company(session)
+    build_edges(session, company, _StubProvider(relations=MODEL_RELATIONS))
+
+    assert relation_tickers(session, "TEST", "competitor") == ["AMD", "INTC"]
+    assert relation_tickers(session, "TEST", "supplier") == ["TSM"]
+    assert relation_tickers(session, "TEST", "customer") == ["MSFT"]
+    assert relation_tickers(session, "TEST", "factor") == []
+
+
+def test_country_codes_are_ordered_by_weight(session: Session) -> None:
+    company = _company(session)
+    relations = Relations(
+        competitors=(),
+        suppliers=(),
+        customers=(),
+        countries=(("CN", 0.2), ("TW", 0.55), ("JP", 0.2)),
+    )
+    build_edges(session, company, _StubProvider(relations=relations))
+
+    # Largest weight first; ties break on the code, so the order is total.
+    assert country_codes(session, "TEST") == [("TW", 0.55), ("CN", 0.2), ("JP", 0.2)]
+    assert country_codes(session, "OTHER") == []
+
+
+def test_edges_to_dicts_shape(session: Session) -> None:
+    company = _company(session)
+    build_edges(session, company, _StubProvider(relations=MODEL_RELATIONS), {"oil": 0.5})
+
+    payload = edges_to_dicts(edges_of(session, "TEST", "country"))
+
+    assert payload == [
+        {"dst": "CN", "relation": "country", "weight": 0.25, "source": "model"},
+        {"dst": "TW", "relation": "country", "weight": 0.4, "source": "model"},
+    ]
+    assert edges_to_dicts([]) == []

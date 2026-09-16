@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, date, datetime
+from types import SimpleNamespace
 
 import pytest
 from sqlmodel import select
@@ -29,6 +31,8 @@ from stock_moves.providers.base import (
 )
 from stock_moves.providers.heuristic import HeuristicProvider
 from stock_moves.scoring import (
+    GEO_CAP,
+    geo_gate,
     heuristic_components,
     heuristic_relevance,
     linked_articles,
@@ -43,6 +47,16 @@ MOVE_DATE = date(2025, 6, 3)
 COMPANY_URL = "https://example.test/testcorp-guidance"
 MACRO_URL = "https://example.test/fed-holds"
 PEER_URL = "https://example.test/peer-tumbles"
+GEO_URL = "https://example.test/taiwan-tariffs"
+
+COMPANY_TITLE = "Test Corp shares slide after guidance cut"
+GEO_TITLE = "Taiwan tariff threat rattles chip supply chains"
+
+# On or before the move day, so `timing` is 1.0 and the weighted sum of a
+# well-sourced macro headline is 0.35 + 0.05 + 0.15 + 0.15 + 0.015 = 0.715 —
+# comfortably above GEO_CAP, which is what makes the cap visible.
+GEO_PUBLISHED = datetime(2025, 6, 2, 12, 0, tzinfo=UTC)
+UNCAPPED = 0.715
 
 
 def _item(
@@ -222,10 +236,14 @@ def _ctx() -> MoveContext:
     )
 
 
-def _input(source: str | None = "Reuters", published_at: datetime | None = None) -> ArticleInput:
+def _input(
+    source: str | None = "Reuters",
+    published_at: datetime | None = None,
+    title: str = COMPANY_TITLE,
+) -> ArticleInput:
     return ArticleInput(
         id=1,
-        title="Test Corp shares slide after guidance cut",
+        title=title,
         source=source,
         url=COMPANY_URL,
         published_at=published_at,
@@ -411,3 +429,153 @@ def test_a_model_provider_that_returns_nothing(
         assert link.model_score == pytest.approx(0.0)
         assert link.category == "company"
         assert link.relevance == pytest.approx(baseline[link.article_id] / 2)
+
+
+# --------------------------------------------------------------------------- #
+# The geopolitical gate (v1.5 plan, decision 7)
+# --------------------------------------------------------------------------- #
+
+
+def _geo_ctx(
+    countries: tuple[tuple[str, float], ...] = (("TW", 1.0),),
+    macro_driver: str | None = "country:TW",
+) -> MoveContext:
+    """A macro-routed move with country edges: the gate's precondition."""
+    return replace(_ctx(), routing="macro", countries=countries, macro_driver=macro_driver)
+
+
+def _geo_components(ctx: MoveContext, title: str = GEO_TITLE) -> dict[str, float | str | None]:
+    """The components of one well-sourced macro headline on `ctx`."""
+    return heuristic_components(
+        ctx,
+        _input(published_at=GEO_PUBLISHED, title=title),
+        ArticleScore(1, 1.0, "macro"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("macro_driver", "expected"),
+    [
+        ("country:TW", 1.0),  # the country's own factor moved
+        ("oil", 1.0),  # a global channel is enough
+        ("dollar", 1.0),
+        ("country:CN", 0.0),  # a factor, but not this headline's country
+        ("rates", 0.0),  # neither oil nor dollar
+        (None, 0.0),  # no macro factor moved at all
+    ],
+)
+def test_geo_gate_needs_the_edge_and_the_driver(macro_driver: str | None, expected: float) -> None:
+    assert geo_gate(GEO_TITLE, _geo_ctx(macro_driver=macro_driver)) == expected
+
+
+def test_an_open_gate_leaves_the_relevance_alone() -> None:
+    components = _geo_components(_geo_ctx())
+
+    assert components["geo_gate"] == 1.0
+    assert heuristic_relevance(components) == pytest.approx(UNCAPPED)
+    assert heuristic_relevance(components) > GEO_CAP
+
+
+def test_a_shut_gate_caps_the_relevance() -> None:
+    # The company has the Taiwan edge, but nothing macro moved that day, so
+    # the headline is a coincidence rather than the cause.
+    components = _geo_components(_geo_ctx(macro_driver=None))
+
+    assert components["geo_gate"] == 0.0
+    assert heuristic_relevance(components) <= GEO_CAP
+    assert heuristic_relevance(components) == pytest.approx(GEO_CAP)
+
+
+def test_a_country_with_no_edge_shuts_the_gate() -> None:
+    # China moved the factor, the headline is about Taiwan, and Taiwan is not
+    # a country this company touches.
+    components = _geo_components(_geo_ctx(countries=(("CN", 1.0),), macro_driver="country:CN"))
+
+    assert geo_gate(GEO_TITLE, _geo_ctx(countries=(("CN", 1.0),), macro_driver="country:CN")) == 0.0
+    assert components["geo_gate"] == 0.0
+    assert heuristic_relevance(components) == pytest.approx(GEO_CAP)
+
+
+def test_a_non_geo_headline_has_no_gate() -> None:
+    components = _geo_components(_geo_ctx(), title=COMPANY_TITLE)
+
+    assert geo_gate(COMPANY_TITLE, _geo_ctx()) is None
+    assert components["geo_gate"] is None
+    # `None` is "not applicable", not "shut": nothing is capped.
+    assert heuristic_relevance(components) == pytest.approx(UNCAPPED)
+
+
+class EagerProvider(StubProvider):
+    """A "model" that loves every headline — what the cap has to survive."""
+
+    name: str = "eager"
+
+    def score_articles(
+        self, move: MoveContext, articles: Sequence[ArticleInput]
+    ) -> list[ArticleScore]:
+        return [ArticleScore(article.id, 1.0, "macro") for article in articles]
+
+
+def _geo_article(session: Session) -> list[Article]:
+    return upsert_articles(
+        session,
+        [_item(GEO_URL, GEO_TITLE, "Reuters", GEO_PUBLISHED, "macro")],
+    )
+
+
+def _with_countries(company: Company, countries: tuple[tuple[str, float], ...]) -> SimpleNamespace:
+    """The `companies` row plus its `country` edges.
+
+    `company_edges` is its own table, so the edges are attached by the caller
+    rather than read off the row; `MoveContext.from_objects` reads every edge
+    field with `getattr`, which is what lets a plain record stand in here.
+    """
+    return SimpleNamespace(
+        ticker=company.ticker,
+        name=company.name,
+        sector=company.sector,
+        industry=company.industry,
+        peers=company.peers,
+        countries=countries,
+    )
+
+
+def test_score_and_link_stores_a_shut_gate_and_caps_the_model(
+    session: Session, company: Company, move: Move
+) -> None:
+    articles = _geo_article(session)
+
+    links = score_and_link(session, move, company, articles, EagerProvider())
+
+    assert len(links) == 1
+    link = links[0]
+    # The fixture company has no country edges — the keyless case — so the
+    # gate shuts, and the model's 1.0 cannot lift the mean back over the cap.
+    assert link.geo_gate == pytest.approx(0.0)
+    assert link.model_score == pytest.approx(1.0)
+    assert link.relevance == pytest.approx(GEO_CAP)
+
+
+def test_score_and_link_stores_an_open_gate(session: Session, company: Company, move: Move) -> None:
+    move.routing = "macro"
+    move.macro_driver = "country:TW"
+    session.add(move)
+    session.commit()
+    articles = _geo_article(session)
+
+    links = score_and_link(
+        session, move, _with_countries(company, (("TW", 1.0),)), articles, EagerProvider()
+    )
+
+    assert links[0].geo_gate == pytest.approx(1.0)
+    assert links[0].relevance > GEO_CAP
+
+
+def test_a_gate_that_never_applied_is_stored_as_null(
+    session: Session, company: Company, move: Move
+) -> None:
+    links = score_and_link(
+        session, move, company, upsert_articles(session, _items()), HeuristicProvider()
+    )
+
+    assert all(link.geo_gate is None for link in links)

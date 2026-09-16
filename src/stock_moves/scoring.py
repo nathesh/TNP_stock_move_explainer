@@ -17,6 +17,13 @@ Two jobs, kept in one module because they share the `articles` /
 The five components and their weights come from `docs/architecture-v1.md`
 (`move_articles`): bucket_match 0.35, entity_match 0.20, timing 0.15,
 source_tier 0.15, coverage 0.15.
+
+v1.5 adds a sixth stored number that is *not* one of the five and carries no
+weight: `geo_gate` (plan decision 7). A geopolitical headline is cheap to find
+and almost always irrelevant, so one is capped at `GEO_CAP` unless the company
+actually has the country edge *and* that country's factor is what moved the
+stock that day. The cap is applied after the weighted sum, so the five stored
+components still explain the number they produced.
 """
 
 from __future__ import annotations
@@ -28,6 +35,7 @@ from datetime import UTC, datetime
 from sqlmodel import Session, col, select
 
 from stock_moves.models import Article, Company, Move, MoveArticle, utcnow
+from stock_moves.news import geo
 from stock_moves.news.base import NewsItem
 from stock_moves.providers.base import (
     ArticleInput,
@@ -38,7 +46,9 @@ from stock_moves.providers.base import (
 from stock_moves.providers.heuristic import HeuristicProvider
 
 __all__ = [
+    "GEO_CAP",
     "WEIGHTS",
+    "geo_gate",
     "heuristic_components",
     "heuristic_relevance",
     "linked_articles",
@@ -58,6 +68,20 @@ WEIGHTS: dict[str, float] = {
 }
 
 _CATEGORIES: frozenset[str] = frozenset({"company", "industry", "macro"})
+
+#: A component map: the five weighted numbers, `timing_kind`, and `geo_gate`,
+#: which is the one entry that may be `None`.
+Components = dict[str, float | str | None]
+
+GEO_CAP: float = 0.30
+"""Relevance ceiling for a geopolitical headline whose gate is shut."""
+
+# The two drivers that open the gate for any country the company touches: an
+# oil or dollar move is the channel through which a foreign event reaches a
+# domestic share price, so it needs no country-specific factor.
+_GLOBAL_DRIVERS: frozenset[str] = frozenset({"oil", "dollar"})
+
+_COUNTRY_PREFIX = "country:"
 
 # Static outlet tiers. Matched case-insensitively as a substring, because the
 # source string is whatever the feed printed ("Reuters", "reuters.com",
@@ -190,13 +214,45 @@ def to_inputs(articles: Sequence[Article]) -> list[ArticleInput]:
 # --------------------------------------------------------------------------- #
 
 
+def geo_gate(title: str, move: MoveContext) -> float | None:
+    """Whether a geopolitical headline may be credited to `move` (decision 7).
+
+    `None` means the gate does not apply: the title names none of the
+    geopolitical vocabulary, so it is scored like any other headline. When it
+    does apply the gate opens (1.0) only if *both* halves hold:
+
+    * the title names a country the company has a `country` edge to, and
+    * the day's `macro_driver` is that country's factor (`country:XX`) or one
+      of the two global channels a foreign event reaches a share price
+      through, `oil` and `dollar`.
+
+    Either half alone is a coincidence — a tariff headline on a day no macro
+    factor moved, or a macro day whose headline names a country the company
+    does not touch — so the gate shuts (0.0) and `heuristic_relevance` caps the
+    score at `GEO_CAP`. Both or nothing is the point of the rule: without a
+    model key a company has no country edges at all, so the gate can never
+    open, which is the honest behaviour rather than a guess.
+    """
+    if not geo.is_geo_headline(title):
+        return None
+    named = geo.countries_in(title, [code for code, _ in move.countries])
+    if not named:
+        return 0.0
+    driver = (move.macro_driver or "").strip()
+    if driver in _GLOBAL_DRIVERS:
+        return 1.0
+    if driver.startswith(_COUNTRY_PREFIX) and driver[len(_COUNTRY_PREFIX) :].upper() in named:
+        return 1.0
+    return 0.0
+
+
 def heuristic_components(
     ctx: MoveContext,
     article: ArticleInput,
     heuristic_score: ArticleScore,
     n_sources_same_story: int = 1,
-) -> dict[str, float | str]:
-    """The five stored components in [0, 1], plus `timing_kind`.
+) -> Components:
+    """The five stored components in [0, 1], plus `timing_kind` and `geo_gate`.
 
     `heuristic_score` supplies the keyword category, which is what makes
     `bucket_match` and `entity_match` more than a restatement of each other:
@@ -207,6 +263,9 @@ def heuristic_components(
     day and `"report"` for one published after it — an after-the-fact write-up
     is still evidence, just weaker. It is `""` when the source gave no date,
     since neither label would be true; `score_and_link` stores that as NULL.
+
+    `geo_gate` is not weighted with the five: it is a cap applied afterwards
+    by `heuristic_relevance`, and `None` for the headlines it does not touch.
     """
     category = heuristic_score.category
 
@@ -238,18 +297,34 @@ def heuristic_components(
         "source_tier": source_tier(article.source),
         "coverage": coverage,
         "timing_kind": timing_kind,
+        "geo_gate": geo_gate(article.title, ctx),
     }
 
 
-def _component(components: dict[str, float | str], name: str) -> float:
+def _component(components: Components, name: str) -> float:
     """One numeric component, 0.0 when absent or not a number."""
     value = components.get(name, 0.0)
     return float(value) if isinstance(value, (int, float)) else 0.0
 
 
-def heuristic_relevance(components: dict[str, float | str]) -> float:
-    """The weighted sum of the five components, in [0, 1]."""
-    return _clamp(sum(weight * _component(components, name) for name, weight in WEIGHTS.items()))
+def _gate(components: Components) -> float | None:
+    """The stored `geo_gate`, or None when the gate did not apply."""
+    value = components.get("geo_gate")
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def heuristic_relevance(components: Components) -> float:
+    """The weighted sum of the five components, in [0, 1], after the geo cap.
+
+    A shut gate (`geo_gate == 0.0`) caps the sum at `GEO_CAP`; an open gate and
+    a gate that never applied leave the sum alone.
+    """
+    relevance = _clamp(
+        sum(weight * _component(components, name) for name, weight in WEIGHTS.items())
+    )
+    if _gate(components) == 0.0:
+        return min(relevance, GEO_CAP)
+    return relevance
 
 
 def _coverage_counts(articles: Sequence[ArticleInput]) -> dict[int, int]:
@@ -275,7 +350,8 @@ def score_and_link(
     stored relevance is the mean of the two scores and the category is the
     model's. The rest are linked with the heuristic relevance and a NULL
     `model_score`, so nothing is lost and model spend stays at one call per
-    move.
+    move. A headline whose `geo_gate` shut is capped at `GEO_CAP` on both
+    paths, the model's mean included.
     """
     if move.id is None:
         raise ValueError("score_and_link needs a persisted move: move.id is None")
@@ -292,7 +368,7 @@ def score_and_link(
     heuristic_scores = HeuristicProvider().score_articles(ctx, inputs)
     coverage = _coverage_counts(inputs)
 
-    scored: list[tuple[ArticleInput, dict[str, float | str], float]] = []
+    scored: list[tuple[ArticleInput, Components, float]] = []
     for article, score in zip(inputs, heuristic_scores, strict=False):
         components = heuristic_components(ctx, article, score, coverage.get(article.id, 1))
         scored.append((article, components, heuristic_relevance(components)))
@@ -324,6 +400,7 @@ def score_and_link(
         category = heuristic_category.get(article.id, routing)
         relevance = base_relevance
         model_score: float | None = None
+        gate = _gate(components)
 
         if model_run and article.id in top_ids:
             result = model_scores.get(article.id)
@@ -334,6 +411,11 @@ def score_and_link(
             model_category = result.category if result is not None else routing
             category = model_category if model_category in _CATEGORIES else routing
             relevance = _clamp((base_relevance + model_score) / 2)
+            # The cap is on the stored relevance, not only on the heuristic
+            # half of it: a model that loves a gated headline must not be able
+            # to lift it back over `GEO_CAP`.
+            if gate == 0.0:
+                relevance = min(relevance, GEO_CAP)
 
         links.append(
             MoveArticle(
@@ -350,6 +432,7 @@ def score_and_link(
                 # "" means the source gave no date, so neither label is true.
                 timing_kind=str(components.get("timing_kind") or "") or None,
                 model_score=model_score,
+                geo_gate=gate,
             )
         )
 
