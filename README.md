@@ -293,7 +293,7 @@ threshold (`POST .../ingest?z_threshold=1.5`) to make more days into moves.
 uv run pytest -q
 ```
 
-306 tests, and **none of them touch the network**: prices, news and both
+636 tests, and **none of them touch the network**: prices, news and both
 model providers are all faked. They cover move detection and the decomposition
 on synthetic price frames, the RSS and GDELT parsers on canned payloads, the
 keyless scorer and explainer, the phrasing rules in `narrate` (including that
