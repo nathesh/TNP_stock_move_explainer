@@ -24,6 +24,7 @@ and markdown would show up as literal asterisks.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -64,6 +65,25 @@ _DOMINANT_SHARE = 0.5
 #: moved alone; more than the upper bound means the whole group moved.
 _PEERS_ALONE = 0.4
 _PEERS_TOGETHER = 0.6
+
+#: How many related tickers a sentence names before it counts the rest. Three
+#: symbols in a row is already a list rather than a sentence, and the point of
+#: the share-shift line is *who* the money went to, not the full roster.
+_MAX_NAMED = 2
+
+#: The two company-side sub-buckets and the four factor proxies of v1.5
+#: decision 4. Held as literals rather than imported from `moves` because this
+#: module imports nothing from the rest of the app; the strings are the storage
+#: contract either way.
+_SUB_SHARE_SHIFT = "share_shift"
+_SUB_SUPPLY_CHAIN = "supply_chain"
+_COUNTRY_PREFIX = "country:"
+_FACTOR_DRIVERS: frozenset[str] = frozenset({"oil", "dollar", "rates", "gold"})
+
+#: A rendered `geo_events` line: "2025-04-03 CN 14 headlines: <title>". Parsed
+#: rather than re-queried because `narrate` never touches the database — the
+#: caller has already turned the rows into these lines.
+_GEO_LINE = re.compile(r"^(\d{4}-\d{2}-\d{2})\s+([A-Za-z]{2})\s+(\d+)\s+headlines")
 
 _NUMBER_WORDS: dict[int, str] = {
     2: "twice",
@@ -168,6 +188,30 @@ class MoveFacts:
     idio_component: float | None = None
     peer_comove: float | None = None
 
+    # --- v1.5: the relationship layer -------------------------------------- #
+    # The signals `sub_routing` is built from, plus the names needed to say
+    # them out loud. Every one is defaulted, so a caller that knows none of
+    # them -- a v1 row, or the chat renderer's dict -- keeps working and simply
+    # renders the v1 sentences.
+
+    #: "share_shift" | "supply_chain" | "oil" | "dollar" | "rates" | "gold" |
+    #: "country:XX", or None when no rule fired (v1.5 decision 6).
+    sub_routing: str | None = None
+    macro_driver: str | None = None
+    #: The driver's contribution to the day's return, as a return.
+    macro_driver_component: float | None = None
+    #: Same-day co-movement of the `competitor` edges, and of the
+    #: `supplier`/`customer` edges.
+    rival_comove: float | None = None
+    chain_comove: float | None = None
+    competitors: tuple[str, ...] = ()
+    suppliers: tuple[str, ...] = ()
+    customers: tuple[str, ...] = ()
+    countries: tuple[tuple[str, float], ...] = ()
+    #: Rendered geo-event lines for the move's window, as
+    #: `news.geo.geo_event_lines` writes them.
+    geo_events: tuple[str, ...] = ()
+
     @classmethod
     def from_context(cls, move: Any) -> MoveFacts:
         """Build from a provider's `MoveContext`.
@@ -192,6 +236,16 @@ class MoveFacts:
             sector_component=_as_float(getattr(move, "sector_component", None)),
             idio_component=_as_float(getattr(move, "idio_component", None)),
             peer_comove=_as_float(getattr(move, "peer_comove", None)),
+            sub_routing=_as_str(getattr(move, "sub_routing", None)),
+            macro_driver=_as_str(getattr(move, "macro_driver", None)),
+            macro_driver_component=_as_float(getattr(move, "macro_driver_component", None)),
+            rival_comove=_as_float(getattr(move, "rival_comove", None)),
+            chain_comove=_as_float(getattr(move, "chain_comove", None)),
+            competitors=_as_str_tuple(getattr(move, "competitors", None)),
+            suppliers=_as_str_tuple(getattr(move, "suppliers", None)),
+            customers=_as_str_tuple(getattr(move, "customers", None)),
+            countries=_as_weighted_tuple(getattr(move, "countries", None)),
+            geo_events=_as_str_tuple(getattr(move, "geo_events", None)),
         )
 
     @classmethod
@@ -211,6 +265,15 @@ class MoveFacts:
             sector_component=_as_float(move.get("sector_component")),
             idio_component=_as_float(move.get("idio_component")),
             peer_comove=_as_float(move.get("peer_comove")),
+            # The five v1.5 columns `move_to_dict` carries (decision 10). The
+            # edge lists are not in that dict -- they are facts about the
+            # company, not about the day -- so a move rendered from a mapping
+            # says "rivals" where one rendered from a context names them.
+            sub_routing=_as_str(move.get("sub_routing")),
+            macro_driver=_as_str(move.get("macro_driver")),
+            macro_driver_component=_as_float(move.get("macro_driver_component")),
+            rival_comove=_as_float(move.get("rival_comove")),
+            chain_comove=_as_float(move.get("chain_comove")),
         )
 
 
@@ -221,6 +284,48 @@ def _as_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _as_str(value: Any) -> str | None:
+    """A non-empty string, or None -- so `""` and absent read the same."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _as_str_tuple(value: Any) -> tuple[str, ...]:
+    """A sequence of strings as a tuple; `()` for absent, and for a bare string
+    (one string is not a list of tickers)."""
+    if value is None or isinstance(value, (str, bytes)):
+        return ()
+    try:
+        return tuple(str(item).strip() for item in value if str(item).strip())
+    except TypeError:
+        return ()
+
+
+def _as_weighted_tuple(value: Any) -> tuple[tuple[str, float], ...]:
+    """`(code, weight)` pairs, skipping anything that is not such a pair."""
+    if value is None or isinstance(value, (str, bytes)):
+        return ()
+    try:
+        items = list(value)
+    except TypeError:
+        return ()
+    pairs: list[tuple[str, float]] = []
+    for item in items:
+        if isinstance(item, (str, bytes)):
+            continue
+        try:
+            code, weight = item
+        except (TypeError, ValueError):
+            continue
+        number = _as_float(weight)
+        if number is None:
+            continue
+        pairs.append((str(code).strip().upper(), number))
+    return tuple(pairs)
 
 
 def _join(items: Sequence[str]) -> str:
@@ -472,6 +577,170 @@ def peers_sentence(facts: MoveFacts) -> str | None:
 
 
 # --------------------------------------------------------------------------- #
+# Saying a relationship -- the v1.5 sentences (plan decision 9)
+# --------------------------------------------------------------------------- #
+
+
+def _clean_names(names: Sequence[str]) -> list[str]:
+    """Upper-cased, de-duplicated, blank-free tickers, in the order given."""
+    return [name for name in dict.fromkeys(str(n).strip().upper() for n in names) if name]
+
+
+def _name_list(names: Sequence[str]) -> str:
+    """`AMD`, `AMD and INTC`, `AMD, INTC and two others`.
+
+    Past two symbols the sentence stops being a sentence, and the reader does
+    not need the roster: the claim is that the money went to rivals, and two of
+    them plus a count is as much of that as prose can carry.
+    """
+    kept = list(names)
+    if len(kept) <= _MAX_NAMED:
+        return _join(kept)
+    rest = len(kept) - _MAX_NAMED
+    others = f"{count_word(rest)} other" + ("s" if rest > 1 else "")
+    return _join([*kept[:_MAX_NAMED], others])
+
+
+def _moved_verb(ret: float) -> str:
+    """`-0.036` -> `fell 3.6%`.
+
+    A verb rather than `plain_move`'s "down 3.6%" because the subject here is a
+    named company: "TSM down 3.6%" is a ticker tape, "TSM fell 3.6%" is English.
+    """
+    return f"{'fell' if ret < 0 else 'rose'} {abs(ret):.1%}"
+
+
+def _comove_sentence(
+    lead: str, comove: float | None, names: Sequence[str], fallback: str
+) -> str | None:
+    """`<lead>: AMD rose 3.1% the same day.`, or None with no number to say.
+
+    `comove` is a *mean* across the related names, so it is labelled as one
+    whenever the subject is not a single company.
+    """
+    if comove is None:
+        return None
+    kept = _clean_names(names)
+    who = _name_list(kept) if kept else fallback
+    average = "" if len(kept) == 1 else " on average"
+    return f"{lead}: {who} {_moved_verb(comove)}{average} the same day."
+
+
+def share_shift_sentence(facts: MoveFacts) -> str | None:
+    """The rivals that moved the other way, when routing said `share_shift`.
+
+    Said only when the sub-bucket was actually stored: the co-movement number
+    on its own is not the claim -- `moves.sub_route` is the one place that
+    decides whether rivals moving against the stock was large enough to mean
+    anything, and this sentence repeats its verdict rather than re-deriving it.
+    """
+    if facts.sub_routing != _SUB_SHARE_SHIFT:
+        return None
+    return _comove_sentence("Share shift", facts.rival_comove, facts.competitors, "rivals")
+
+
+def supply_chain_sentence(facts: MoveFacts) -> str | None:
+    """The suppliers and customers that moved with it, when routing said
+    `supply_chain`."""
+    if facts.sub_routing != _SUB_SUPPLY_CHAIN:
+        return None
+    chain = (*facts.suppliers, *facts.customers)
+    return _comove_sentence("Supply chain", facts.chain_comove, chain, "suppliers and customers")
+
+
+def _driver_of(facts: MoveFacts) -> str | None:
+    """The macro driver this move was actually labelled with, or None.
+
+    `sub_routing` is the authority: `macro_driver` is computed for every day,
+    whatever the routing bucket, so a company-driven day with a jumpy oil price
+    still carries one and must not be narrated as a macro day. The fallback to
+    `macro_driver` exists for facts built from a mapping that predates
+    `sub_routing`, and is taken only when the move routed macro.
+    """
+    candidates = (facts.sub_routing, facts.macro_driver if facts.routing == "macro" else None)
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if candidate in _FACTOR_DRIVERS:
+            return candidate
+        if candidate.startswith(_COUNTRY_PREFIX) and candidate[len(_COUNTRY_PREFIX) :]:
+            return candidate
+    return None
+
+
+def _country_name(code: str) -> str:
+    """`TW` -> `Taiwan`; an unmapped code is its own name.
+
+    Imported late, and from the one module that already owns the mapping, so
+    this file keeps its promise to import nothing from the rest of the app at
+    module level.
+    """
+    from stock_moves.news.geo import COUNTRY_NAMES
+
+    return COUNTRY_NAMES.get(code, code)
+
+
+def _geo_headline_count(facts: MoveFacts, code: str) -> int | None:
+    """The stored headline count for this country on the day of the move.
+
+    The lines are `news.geo.geo_event_lines` output and cover a ±1 day window,
+    so the move's own date is picked out of them; a country-day with no row
+    yields None and the clause that would have said it is dropped rather than
+    printed as a zero.
+    """
+    if facts.day is None:
+        return None
+    wanted = facts.day.isoformat()
+    for line in facts.geo_events:
+        match = _GEO_LINE.match(str(line).strip())
+        if match is None:
+            continue
+        day, country, count = match.groups()
+        if day == wanted and country.upper() == code:
+            return int(count)
+    return None
+
+
+def geo_sentence(facts: MoveFacts) -> str | None:
+    """Name the macro driver the move was routed to (v1.5 decisions 4 and 6).
+
+    Two shapes, because the two drivers are different claims. A country
+    exposure is a *gated* one -- it is said only because the company has an
+    edge to that country and the country's ETF moved -- so the sentence names
+    the exposure, the ETF and, when there is one, how loud that country was in
+    the news that day. A commodity or rates proxy needs none of that: there is
+    one number and one clause.
+
+    The percentage is the driver's contribution to this stock's return
+    (`beta * proxy return`), not the proxy's own move, which is why it is said
+    as what the ETF moved *the stock*.
+    """
+    driver = _driver_of(facts)
+    if driver is None:
+        return None
+
+    component = facts.macro_driver_component
+    moved = None if component is None else f"{abs(component):.1%}"
+
+    if not driver.startswith(_COUNTRY_PREFIX):
+        if moved is None:
+            return f"Macro, via {driver}."
+        return f"Macro, via {driver}: the {driver} proxy moved the stock {moved}."
+
+    code = driver[len(_COUNTRY_PREFIX) :].upper()
+    name = _country_name(code)
+    clauses = []
+    if moved is not None:
+        clauses.append(f"the {name} ETF moved the stock {moved}")
+    count = _geo_headline_count(facts, code)
+    if count is not None:
+        headline = "headline" if count == 1 else "headlines"
+        clauses.append(f"{count_word(count)} geopolitical {headline} named {name}")
+    head = f"Macro, geopolitical, via {name} exposure"
+    return f"{head}: {_join(clauses)}." if clauses else f"{head}."
+
+
+# --------------------------------------------------------------------------- #
 # Saying one move
 # --------------------------------------------------------------------------- #
 
@@ -491,6 +760,13 @@ def summary_sentences(facts: MoveFacts, headlines: Sequence[str] = ()) -> list[s
         sentence
         for sentence in (
             attribution_sentence(facts),
+            # The v1.5 sentences sit here, between the split and the calendar:
+            # they are a finer reading of the same question the split answers
+            # ("what was this move about?"), and they are absent whenever the
+            # move carried no sub-bucket, which is most days.
+            share_shift_sentence(facts),
+            supply_chain_sentence(facts),
+            geo_sentence(facts),
             event_sentence(facts),
             peers_sentence(facts),
         )

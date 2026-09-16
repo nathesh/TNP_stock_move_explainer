@@ -10,6 +10,7 @@ decomposition would be worse than the unreadable one it replaced.
 from __future__ import annotations
 
 from datetime import date
+from types import SimpleNamespace
 from typing import Any
 
 from stock_moves.narrate import (
@@ -17,12 +18,15 @@ from stock_moves.narrate import (
     MoveFacts,
     attribution_sentence,
     count_word,
+    geo_sentence,
     narrate_moves,
     narrate_news,
     peers_sentence,
+    share_shift_sentence,
     short_company_name,
     size_phrase,
     summary_sentences,
+    supply_chain_sentence,
 )
 
 JARGON = ("sigma", "z=", "z-score", "idiosyncratic", "beta", "pp")
@@ -348,6 +352,239 @@ def test_scheduled_events_are_named_in_ordinary_words() -> None:
     assert "Federal Reserve rate decision" in said
     assert "inflation release" in said
     assert "FOMC" not in said and "CPI" not in said
+
+
+# --------------------------------------------------------------------------- #
+# The v1.5 sentences -- share shift, supply chain, macro driver
+# --------------------------------------------------------------------------- #
+
+
+def shift(**overrides: Any) -> MoveFacts:
+    """A company-routed move that `moves.sub_route` labelled `share_shift`."""
+    base: dict[str, Any] = {
+        "ticker": "NVDA",
+        "company": "NVIDIA",
+        "routing": "company",
+        "sub_routing": "share_shift",
+        "rival_comove": 0.031,
+        "competitors": ("AMD",),
+    }
+    base.update(overrides)
+    return facts(**base)
+
+
+def geo(**overrides: Any) -> MoveFacts:
+    """A macro-routed move whose driver is a country exposure."""
+    base: dict[str, Any] = {
+        "ticker": "AAPL",
+        "company": "Apple",
+        "day": date(2025, 4, 3),
+        "ret": -0.092,
+        "ret_z": -4.7,
+        "routing": "macro",
+        "sub_routing": "country:TW",
+        "macro_driver": "country:TW",
+        "macro_driver_component": -0.023,
+        "countries": (("TW", 0.4),),
+        "geo_events": (
+            "2025-04-02 TW 3 headlines: Taipei braces for tariff decision",
+            "2025-04-03 TW 14 headlines: Taiwan hit by new tariffs",
+        ),
+    }
+    base.update(overrides)
+    return facts(**base)
+
+
+def test_a_share_shift_names_the_rival_and_which_way_it_went() -> None:
+    assert share_shift_sentence(shift()) == "Share shift: AMD rose 3.1% the same day."
+
+
+def test_several_rivals_are_named_two_at_a_time_and_then_counted() -> None:
+    """Three symbols in a row is a list, not a sentence -- and the number is a
+    mean, so it says so once it stops being about one company."""
+    said = share_shift_sentence(shift(competitors=("AMD", "INTC", "AVGO", "MU")))
+    assert said == "Share shift: AMD, INTC and two others rose 3.1% on average the same day."
+    assert share_shift_sentence(shift(competitors=("AMD", "INTC", "AVGO"))) == (
+        "Share shift: AMD, INTC and one other rose 3.1% on average the same day."
+    )
+
+
+def test_a_share_shift_with_no_stored_rivals_still_says_the_direction() -> None:
+    """The edges are facts about the company and may not have been loaded; the
+    verdict is still the move's."""
+    assert share_shift_sentence(shift(competitors=())) == (
+        "Share shift: rivals rose 3.1% on average the same day."
+    )
+
+
+def test_the_share_shift_sentence_is_absent_without_the_signal() -> None:
+    # No sub-bucket: `moves.sub_route` is the only thing that decides whether
+    # rivals moving the other way was large enough to mean anything.
+    assert share_shift_sentence(shift(sub_routing=None)) is None
+    assert share_shift_sentence(shift(sub_routing="supply_chain")) is None
+    assert share_shift_sentence(shift(rival_comove=None)) is None
+    assert share_shift_sentence(facts()) is None
+
+
+def test_the_supply_chain_sentence_names_the_chain() -> None:
+    made = facts(
+        ticker="NVDA",
+        company="NVIDIA",
+        routing="company",
+        sub_routing="supply_chain",
+        chain_comove=-0.036,
+        suppliers=("TSM",),
+    )
+    assert supply_chain_sentence(made) == "Supply chain: TSM fell 3.6% the same day."
+
+
+def test_the_supply_chain_sentence_covers_customers_as_well_as_suppliers() -> None:
+    made = facts(
+        routing="company",
+        sub_routing="supply_chain",
+        chain_comove=-0.036,
+        suppliers=("TSM",),
+        customers=("DELL",),
+    )
+    said = supply_chain_sentence(made)
+    assert said == "Supply chain: TSM and DELL fell 3.6% on average the same day."
+
+
+def test_the_supply_chain_sentence_is_absent_without_the_signal() -> None:
+    assert supply_chain_sentence(facts()) is None
+    assert supply_chain_sentence(facts(sub_routing="supply_chain")) is None
+    assert supply_chain_sentence(shift()) is None
+
+
+def test_a_country_driver_says_the_exposure_the_etf_and_the_headlines() -> None:
+    assert geo_sentence(geo()) == (
+        "Macro, geopolitical, via Taiwan exposure: the Taiwan ETF moved the stock "
+        "2.3% and 14 geopolitical headlines named Taiwan."
+    )
+
+
+def test_the_headline_clause_is_dropped_when_no_event_matches_that_day() -> None:
+    """A country-day with no stored row is absence of evidence: the clause goes
+    rather than being printed as a zero."""
+    said = geo_sentence(geo(geo_events=("2025-04-02 TW 3 headlines: Taipei braces",)))
+    assert said == (
+        "Macro, geopolitical, via Taiwan exposure: the Taiwan ETF moved the stock 2.3%."
+    )
+    # The same day, a different country: still not this move's evidence.
+    other = geo_sentence(geo(geo_events=("2025-04-03 CN 14 headlines: China retaliates",)))
+    assert other is not None and "headlines" not in other
+
+
+def test_a_commodity_driver_gets_one_short_sentence() -> None:
+    made = facts(
+        routing="macro",
+        sub_routing="oil",
+        macro_driver="oil",
+        macro_driver_component=0.012,
+    )
+    assert geo_sentence(made) == "Macro, via oil: the oil proxy moved the stock 1.2%."
+
+
+def test_a_driver_with_no_contribution_stops_at_the_name() -> None:
+    made = facts(routing="macro", sub_routing="rates", macro_driver="rates")
+    assert geo_sentence(made) == "Macro, via rates."
+
+
+def test_a_macro_driver_on_a_company_day_is_not_narrated_as_macro() -> None:
+    """`macro_driver` is computed for every day whatever the routing, so a
+    company move with a jumpy oil price must not read as an oil day."""
+    made = facts(routing="company", macro_driver="oil", macro_driver_component=0.012)
+    assert geo_sentence(made) is None
+    assert geo_sentence(facts()) is None
+
+
+def test_an_unmapped_country_code_is_its_own_name() -> None:
+    made = facts(
+        routing="macro",
+        sub_routing="country:ZZ",
+        macro_driver="country:ZZ",
+        macro_driver_component=-0.01,
+    )
+    said = geo_sentence(made)
+    assert said is not None and said.startswith("Macro, geopolitical, via ZZ exposure:")
+
+
+def test_the_new_sentences_follow_the_split_and_carry_no_jargon() -> None:
+    said = summary_sentences(shift(day=date(2026, 7, 23)))
+    attribution = next(i for i, s in enumerate(said) if "points" in s or "breakdown" in s)
+    assert said[attribution + 1].startswith("Share shift:")
+    assert not any(term in " ".join(said).lower() for term in JARGON)
+    assert "*" not in " ".join(said) and "#" not in " ".join(said)
+
+
+def test_a_move_with_no_new_signals_reads_exactly_as_it_did_in_v1() -> None:
+    """Every new sentence is absent unless its signal is stored, so the
+    keyless, edgeless install is unchanged."""
+    said = summary_sentences(facts())
+    assert not any(
+        sentence.startswith(("Share shift:", "Supply chain:", "Macro,")) for sentence in said
+    )
+    assert said == summary_sentences(
+        facts(sub_routing=None, macro_driver=None, rival_comove=None, chain_comove=None)
+    )
+
+
+def test_from_context_carries_the_relationship_fields() -> None:
+    """Duck-typed off the provider layer's `MoveContext`, the same way the v1
+    fields are."""
+    context = SimpleNamespace(
+        ticker="NVDA",
+        company_name="NVIDIA Corporation",
+        date=date(2025, 4, 16),
+        ret=-0.069,
+        ret_z=-1.2,
+        routing="company",
+        sub_routing="share_shift",
+        macro_driver="country:TW",
+        macro_driver_component=-0.023,
+        rival_comove=0.031,
+        chain_comove=-0.036,
+        competitors=["amd", "intc"],
+        suppliers=["TSM"],
+        customers=[],
+        countries=[("tw", 0.4)],
+        geo_events=["2025-04-16 TW 9 headlines: export licence"],
+    )
+
+    made = MoveFacts.from_context(context)
+
+    assert made.company == "NVIDIA"
+    assert made.sub_routing == "share_shift"
+    assert made.macro_driver_component == -0.023
+    assert made.rival_comove == 0.031
+    assert made.chain_comove == -0.036
+    # Carried as given; the sentence is the layer that upper-cases a symbol.
+    assert made.competitors == ("amd", "intc")
+    assert share_shift_sentence(made) is not None
+    assert "AMD and INTC" in str(share_shift_sentence(made))
+    assert made.suppliers == ("TSM",)
+    assert made.customers == ()
+    assert made.countries == (("TW", 0.4),)
+    assert made.geo_events == ("2025-04-16 TW 9 headlines: export licence",)
+
+
+def test_a_v1_row_leaves_the_new_fields_at_their_defaults() -> None:
+    made = MoveFacts.from_context(
+        SimpleNamespace(ticker="TSLA", company_name="Tesla, Inc.", date=None, ret=-0.1, ret_z=-2.0)
+    )
+    assert made.sub_routing is None
+    assert made.competitors == () and made.countries == () and made.geo_events == ()
+
+
+def test_the_five_dated_columns_survive_a_move_dict() -> None:
+    """`move_to_dict` carries the five per-day columns; the edge lists are
+    facts about the company and are not in it, so the sentence falls back to
+    the unnamed subject rather than dropping."""
+    made = MoveFacts.from_mapping(
+        move_dict(sub_routing="share_shift", rival_comove=0.031), "NVDA", "NVIDIA"
+    )
+    assert made.sub_routing == "share_shift"
+    assert share_shift_sentence(made) == "Share shift: rivals rose 3.1% on average the same day."
 
 
 # --------------------------------------------------------------------------- #

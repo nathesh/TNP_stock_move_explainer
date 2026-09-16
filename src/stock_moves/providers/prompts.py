@@ -157,7 +157,16 @@ EXPLAIN_SYSTEM = (
     "Mention proximity to earnings, to an FOMC decision or to a CPI release, "
     "the market and sector regime, and how peers moved, when they are "
     "informative; skip them when they are not. Confidence is in [0, 1] and "
-    "should reflect how much the headlines and the decomposition agree.\n\n" + PLAIN_ENGLISH
+    "should reflect how much the headlines and the decomposition agree.\n\n"
+    "When `sub_routing` is 'share_shift', say so and name the competitor from "
+    "`competitors` that moved the other way, with the direction `rival_comove` "
+    "gives: the tape is pointing at a specific rival, which is the most useful "
+    "thing the numbers say that day. When `sub_routing` is 'country:XX', call "
+    "it geopolitical and say 'via <country> exposure' -- the country the code "
+    "names -- because the company has a stored exposure to that country and "
+    "that country's ETF moved; cite a geopolitical event only if one of the "
+    "articles you were given supports it, since `geo_events` is a count of "
+    "headlines rather than an article you may cite.\n\n" + PLAIN_ENGLISH
 )
 
 PEERS_SYSTEM = (
@@ -267,6 +276,24 @@ def move_block(move: MoveContext) -> str:
         "near_cpi": move.near_cpi,
         "peers": list(move.peers) or None,
         "peer_comove": _round(move.peer_comove),
+        # v1.5: the relationship layer. Same rule as the rest of the block --
+        # an edge the app does not have is absent from the JSON rather than
+        # present and empty, so a keyless install (which stores no model edges
+        # at all) hands the model a v1-shaped block instead of a row of nulls
+        # inviting it to explain their absence.
+        "sub_routing": move.sub_routing,
+        "macro_driver": move.macro_driver,
+        "macro_driver_component": _round(move.macro_driver_component),
+        "rival_comove": _round(move.rival_comove),
+        "chain_comove": _round(move.chain_comove),
+        "competitors": list(move.competitors) or None,
+        "suppliers": list(move.suppliers) or None,
+        "customers": list(move.customers) or None,
+        "countries": [
+            {"country": code, "weight": _round(weight, 3)} for code, weight in move.countries
+        ]
+        or None,
+        "geo_events": list(move.geo_events) or None,
     }
     return json.dumps(
         {key: value for key, value in payload.items() if value is not None},

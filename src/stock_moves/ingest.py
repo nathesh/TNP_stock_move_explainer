@@ -24,6 +24,25 @@ worth reading on its own:
   a read needs an ingest, and a per-ticker `threading.Lock` stops two
   simultaneous first requests from both ingesting the same ticker.
 
+**v1.5: the relationship layer, wired in here and nowhere else.** The edge
+table, the factor attribution and the geopolitical counts are all built by
+other modules; this one is where they meet the run, in one fixed order:
+
+1. `ontology.build_edges` twice. The first call needs no prices and gives us
+   the `country` edges; only then do we know which country ETFs to fetch, so
+   the fitted factor betas — which are the `factor` edges — can only be handed
+   to a second call. The two-call shape is the price of deriving factor
+   exposure from prices rather than asking a model for it (plan decision 4).
+2. `build_features(..., factors=...)`, so every stored price row carries
+   `macro_driver` and `macro_driver_component`.
+3. `moves.sub_route` per detected move, from the competitor and
+   supplier/customer co-movements, stored beside the v1 `routing`.
+4. `news.geo` for the moves that came out `country:XX`, so a gate that opens
+   has evidence behind it.
+5. `queries_for_move` expanded along the edges, and a `MoveContext` carrying
+   the countries and the geo lines into `score_and_link`, which is what lets
+   the gate rule (plan decision 7) see anything at all.
+
 `prices` is imported as a module and called as `prices.fetch_ohlcv(...)` so a
 test monkeypatches one module attribute and this layer never touches the
 network.
@@ -34,6 +53,7 @@ from __future__ import annotations
 import logging
 import math
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -45,8 +65,18 @@ from sqlmodel import Session, col, select
 
 from stock_moves import prices
 from stock_moves.explain import FALLBACK_PROVIDER_NAME, get_or_create_explanation
-from stock_moves.models import Company, Explanation, Move, MoveArticle, Price
-from stock_moves.moves import build_features, detect_moves, peer_comove
+from stock_moves.models import Company, CompanyEdge, Explanation, GeoEvent, Move, MoveArticle, Price
+from stock_moves.moves import (
+    SUB_ROUTE_SHARE_SHIFT,
+    SUB_ROUTE_SUPPLY_CHAIN,
+    build_features,
+    compute_returns,
+    detect_moves,
+    factor_betas,
+    peer_comove,
+    signed_comove,
+    sub_route,
+)
 from stock_moves.news import (
     NewsItem,
     NewsSource,
@@ -54,9 +84,16 @@ from stock_moves.news import (
     queries_for_move,
     window_for,
 )
-from stock_moves.ontology import get_or_build_company
+from stock_moves.news import geo as news_geo
+from stock_moves.ontology import (
+    build_edges,
+    country_codes,
+    get_or_build_company,
+    relation_tickers,
+)
 from stock_moves.prices import MARKET_ETF, PriceFetchError
 from stock_moves.providers import ModelProvider, get_provider
+from stock_moves.providers.base import MoveContext
 from stock_moves.queries import has_prices
 from stock_moves.scoring import linked_articles, score_and_link, upsert_articles
 from stock_moves.settings import get_settings
@@ -91,12 +128,20 @@ _FLOAT_FEATURES: tuple[str, ...] = (
     "mkt_component",
     "sector_component",
     "idio_component",
+    # v1.5: the factor attribution (`moves.FACTOR_COLUMNS`), stored on both
+    # `prices` and `moves` exactly like the v1 columns beside it.
+    "macro_driver_component",
 )
-_STR_FEATURES: tuple[str, ...] = ("routing", "regime_mkt", "regime_sector")
+_STR_FEATURES: tuple[str, ...] = ("routing", "regime_mkt", "regime_sector", "macro_driver")
 _BOOL_FEATURES: tuple[str, ...] = ("near_earnings", "near_fomc", "near_cpi")
 
-# The three groups together are exactly `moves.FEATURE_COLUMNS`; `test_ingest`
-# asserts that, so a column added there cannot be silently dropped here.
+# The three groups together are exactly `moves.FEATURE_COLUMNS` plus
+# `moves.FACTOR_COLUMNS`; `test_ingest` asserts that, so a column added to
+# either tuple cannot be silently dropped here.
+
+#: `sub_routing` values that name a country, and the rest of the string is the
+#: ISO-3166 alpha-2 code (v1.5 decision 6).
+_COUNTRY_SUB_ROUTING_PREFIX = "country:"
 
 # --------------------------------------------------------------------------- #
 # Per-ticker locks (DESIGN section 5)
@@ -224,7 +269,12 @@ def _price_columns(row: pd.Series) -> dict[str, Any]:
     return values
 
 
-def _move_columns(row: pd.Series, peer_return: Any) -> dict[str, Any]:
+def _move_columns(
+    row: pd.Series,
+    peer_return: Any,
+    rival_return: Any = None,
+    chain_return: Any = None,
+) -> dict[str, Any]:
     """The stored `moves` columns for one detected row.
 
     `ret_z` is NOT NULL but is NaN during the 20-day warm-up, where the
@@ -232,6 +282,12 @@ def _move_columns(row: pd.Series, peer_return: Any) -> dict[str, Any]:
     a NULL and the insert would fail, and 0.0 sorts such a day last in the
     `abs(ret_z)` ordering, which is exactly where a day with no dispersion
     estimate belongs.
+
+    v1.5 adds three stored numbers and one stored label: the competitor and
+    supplier/customer co-movements, and the `sub_routing` they and the day's
+    `macro_driver` imply. `peer_comove` is untouched beside them — it is still
+    the mean over `companies.peers_json`, and plan decision 2 keeps its name
+    and its meaning.
     """
     values: dict[str, Any] = {
         name: _opt_float(row[name]) for name in _FLOAT_FEATURES if name != "ret"
@@ -246,6 +302,15 @@ def _move_columns(row: pd.Series, peer_return: Any) -> dict[str, Any]:
     values["routing"] = values["routing"] or "company"
     values["direction"] = _opt_str(row.get("direction")) or ("down" if ret < 0 else "up")
     values["peer_comove"] = _opt_float(peer_return)
+    values["rival_comove"] = _opt_float(rival_return)
+    values["chain_comove"] = _opt_float(chain_return)
+    values["sub_routing"] = sub_route(
+        str(values["routing"]),
+        ret,
+        values["rival_comove"],
+        values["chain_comove"],
+        values["macro_driver"],
+    )
     return values
 
 
@@ -276,6 +341,146 @@ class IngestResult:
     n_explanations: int
     provider: str
     news_source: str
+    #: v1.5. `n_edges` is every `company_edges` row for this ticker — the four
+    #: model relations plus the fitted `factor` edges. `n_geo_events` counts
+    #: `geo_events` rows for the countries this company has an edge to, which
+    #: is the only slice of that table the ticker is responsible for; it is 0
+    #: for a company with no country edges, and therefore 0 without a key.
+    n_edges: int = 0
+    n_geo_events: int = 0
+
+
+# --------------------------------------------------------------------------- #
+# v1.5: reading the edges back for one move
+# --------------------------------------------------------------------------- #
+
+
+def _country_of(sub_routing: str | None) -> str | None:
+    """The ISO-3166 code in a `country:XX` sub-routing, or None for any other."""
+    text = (sub_routing or "").strip()
+    if not text.startswith(_COUNTRY_SUB_ROUTING_PREFIX):
+        return None
+    code = text[len(_COUNTRY_SUB_ROUTING_PREFIX) :].strip().upper()
+    return code or None
+
+
+def _display_name(session: Session, ticker: str) -> str:
+    """A related ticker's company name if we happen to have stored one.
+
+    "Only if cheap" is the rule: a `companies` row is one primary-key lookup,
+    and a related ticker usually has none, in which case the symbol itself is
+    handed on — `news.clean_company_name` takes either.
+    """
+    key = ticker.strip().upper()
+    company = session.get(Company, key)
+    name = (company.name or "").strip() if company is not None else ""
+    return name or key
+
+
+def _names_by_sign(
+    returns: pd.DataFrame | None,
+    tickers: Sequence[str],
+    day: date,
+    ret: float,
+    *,
+    opposite: bool,
+) -> list[str]:
+    """Which of `tickers` moved against (or with) a `ret` of `ret` on `day`.
+
+    The mean is what `sub_route` judged; this is the same tape read name by
+    name, because a query is per rival. A name with no bar that day, a flat
+    day, and a move of exactly zero all yield nothing: the sign of zero is not
+    a direction.
+    """
+    move = _opt_float(ret)
+    if returns is None or returns.empty or not tickers or not move:
+        return []
+    stamp = pd.Timestamp(day)
+    if stamp not in returns.index:
+        return []
+    row = returns.loc[stamp]
+    wanted = (-1.0 if opposite else 1.0) * (1.0 if move > 0 else -1.0)
+
+    names: list[str] = []
+    for ticker in tickers:
+        if ticker not in returns.columns:
+            continue
+        value = _opt_float(row[ticker])
+        if not value:
+            continue
+        if (1.0 if value > 0 else -1.0) == wanted:
+            names.append(ticker)
+    return names
+
+
+def _chain_tickers(session: Session, ticker: str) -> list[str]:
+    """Suppliers and customers as one de-duplicated, sorted list."""
+    suppliers = relation_tickers(session, ticker, "supplier")
+    customers = relation_tickers(session, ticker, "customer")
+    return sorted(set(suppliers) | set(customers))
+
+
+def _edge_names(
+    session: Session,
+    move: Move,
+    related_returns: pd.DataFrame | None,
+    period: str,
+) -> tuple[list[str], list[str]]:
+    """`(rival_names, chain_names)` for the move's retrieval expansion.
+
+    Only the sub-bucket that fired asks for names, so at most one of the two
+    lists is ever non-empty and a move with no edge story costs nothing.
+    `related_returns` is the frame `ingest_ticker` already fetched for the
+    co-movements; the on-demand path (`GET /tickers/{t}/moves/{date}`) has no
+    such frame and fetches the few names it needs itself.
+    """
+    sub_routing = (move.sub_routing or "").strip()
+    if sub_routing == SUB_ROUTE_SHARE_SHIFT:
+        tickers = relation_tickers(session, move.ticker, "competitor")
+        opposite = True
+    elif sub_routing == SUB_ROUTE_SUPPLY_CHAIN:
+        tickers = _chain_tickers(session, move.ticker)
+        opposite = False
+    else:
+        return [], []
+
+    if not tickers:
+        return [], []
+
+    frame = related_returns
+    if frame is None:
+        frame = prices.fetch_peer_returns(tickers, period)
+    moved = _names_by_sign(frame, tickers, move.date, move.ret, opposite=opposite)
+    names = [_display_name(session, ticker) for ticker in moved]
+    return (names, []) if opposite else ([], names)
+
+
+def _move_context(
+    session: Session,
+    move: Move,
+    company: Company,
+    start: date,
+    end: date,
+) -> MoveContext:
+    """The v1 context plus the company's edges and the window's geo lines.
+
+    `MoveContext.from_objects` knows only the two rows it is handed, and the
+    edges and the geopolitical counts live in two other tables — so they are
+    read here and replaced onto it. Without this the gate rule sees no
+    countries and shuts on every geopolitical headline.
+    """
+    key = company.ticker.strip().upper()
+    countries = country_codes(session, key)
+    return replace(
+        MoveContext.from_objects(move, company),
+        competitors=tuple(relation_tickers(session, key, "competitor")),
+        suppliers=tuple(relation_tickers(session, key, "supplier")),
+        customers=tuple(relation_tickers(session, key, "customer")),
+        countries=tuple(countries),
+        geo_events=tuple(
+            news_geo.geo_event_lines(session, [code for code, _ in countries], start, end)
+        ),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -293,6 +498,7 @@ def enrich_move(
     refresh: bool = False,
     news_limit: int | None = None,
     top_k: int | None = None,
+    related_returns: pd.DataFrame | None = None,
 ) -> Explanation:
     """Attach news to one move and explain it, reusing whatever is cached.
 
@@ -303,6 +509,15 @@ def enrich_move(
     A failing news source is logged and swallowed per query — the move is still
     explained, from the decomposition alone, which is the case the
     `unexplained` category exists for.
+
+    **v1.5.** The query list is expanded along the move's edges (plan decision
+    8) and the scoring is handed a context carrying the company's countries and
+    the window's geopolitical counts, which is what the gate rule reads.
+    `related_returns` is an optional frame of daily returns for the related
+    tickers — one column per symbol — so the caller that already fetched them
+    (`ingest_ticker`) is not made to fetch them again per move; leaving it None
+    makes this function fetch the few names it needs, and only for the two
+    sub-buckets that name names.
     """
     if move.id is None:
         raise ValueError("enrich_move needs a persisted move: move.id is None")
@@ -317,6 +532,9 @@ def enrich_move(
 
     if refresh or not linked_articles(session, move.id):
         start, end = window_for(move.date)
+        rival_names, chain_names = _edge_names(
+            session, move, related_returns, settings.default_period
+        )
         items: list[NewsItem] = []
         for bucket, query in queries_for_move(
             move.routing,
@@ -324,6 +542,10 @@ def enrich_move(
             company.ticker,
             company.peers,
             company.industry,
+            sub_routing=move.sub_routing,
+            rival_names=rival_names,
+            chain_names=chain_names,
+            country=_country_of(move.sub_routing),
         ):
             try:
                 found = news_source.search(query, start, end, limit=limit)
@@ -344,7 +566,14 @@ def enrich_move(
             stored = upsert_articles(session, items)
             # `score_and_link` keeps its own default top_k (15): that is how
             # many headlines a model re-scores, not how many are explained.
-            score_and_link(session, move, company, stored, provider)
+            score_and_link(
+                session,
+                move,
+                company,
+                stored,
+                provider,
+                context=_move_context(session, move, company, start, end),
+            )
 
     return get_or_create_explanation(
         session,
@@ -396,7 +625,14 @@ def _write_prices(session: Session, ticker: str, features: pd.DataFrame) -> None
     session.commit()
 
 
-def _write_moves(session: Session, ticker: str, detected: pd.DataFrame, comove: pd.Series) -> None:
+def _write_moves(
+    session: Session,
+    ticker: str,
+    detected: pd.DataFrame,
+    comove: pd.Series,
+    rival_comove: pd.Series,
+    chain_comove: pd.Series,
+) -> None:
     """Upsert one `moves` row per detected row, keyed on `(ticker, date)`.
 
     Moves that no longer qualify are left alone: the thresholds are query
@@ -408,7 +644,12 @@ def _write_moves(session: Session, ticker: str, detected: pd.DataFrame, comove: 
 
     for stamp, row in detected.iterrows():
         day = pd.Timestamp(stamp).date()
-        values = _move_columns(row, comove.get(stamp))
+        values = _move_columns(
+            row,
+            comove.get(stamp),
+            rival_comove.get(stamp),
+            chain_comove.get(stamp),
+        )
         move = stored.get(day)
         if move is None:
             session.add(Move(ticker=ticker, date=day, **values))
@@ -417,6 +658,113 @@ def _write_moves(session: Session, ticker: str, detected: pd.DataFrame, comove: 
                 setattr(move, name, value)
             session.add(move)
     session.commit()
+
+
+def _factor_proxies(session: Session, ticker: str) -> dict[str, str]:
+    """The `{factor key: proxy symbol}` map to fetch returns for.
+
+    The four macro proxies always, plus one country ETF per `country` edge that
+    has one. A country outside `prices.COUNTRY_ETFS` keeps its edge and is
+    simply skipped here — plan decision 4 names that limitation rather than
+    inventing a proxy for it, and the consequence is that such a company can
+    only ever be driven by `oil` or `dollar`.
+    """
+    proxies: dict[str, str] = dict(prices.FACTOR_ETFS)
+    for code, _weight in country_codes(session, ticker):
+        symbol = prices.COUNTRY_ETFS.get(code.strip().upper())
+        if symbol:
+            proxies[code.strip().upper()] = symbol
+    return proxies
+
+
+def _latest_betas(betas: pd.DataFrame) -> dict[str, float]:
+    """The last finite beta of each factor column, as the stored edge weight.
+
+    One number per factor is all an edge can carry, and the most recent fitted
+    beta is the one that describes the company now. Columns that never fitted —
+    a proxy with less than the full window of overlapping days — contribute no
+    edge at all rather than a zero, because "no exposure measured" and "no
+    exposure" are different claims.
+    """
+    latest: dict[str, float] = {}
+    for name in betas.columns:
+        for value in reversed(betas[name].to_list()):
+            beta = _opt_float(value)
+            if beta is not None:
+                latest[str(name)] = beta
+                break
+    return latest
+
+
+def _related_returns(rival_returns: pd.DataFrame, chain_returns: pd.DataFrame) -> pd.DataFrame:
+    """The competitor and supplier/customer return frames as one, columns deduped.
+
+    Handed down to `enrich_move` so the names behind a `share_shift` or a
+    `supply_chain` query are read off prices this run already fetched. An empty
+    frame is a real answer — "these names have no returns" — and is passed on
+    as such rather than as None, which would send `enrich_move` back to the
+    network for a fetch that has already failed.
+    """
+    frames = [frame for frame in (rival_returns, chain_returns) if not frame.empty]
+    if not frames:
+        return pd.DataFrame(index=pd.DatetimeIndex([], name="date"))
+    combined = pd.concat(frames, axis=1)
+    return combined.loc[:, ~combined.columns.duplicated()]
+
+
+def _write_geo_events(
+    session: Session,
+    ticker: str,
+    news_source: NewsSource,
+    limit: int,
+) -> None:
+    """Store geopolitical headline counts for the `country:XX` moves (decision 5).
+
+    Only for moves whose stored `sub_routing` names a country, only for
+    countries the company has a `country` edge to, and only over each move's own
+    ±1 day window — the three conditions that keep `geo_events` small. A company
+    with no country edges does nothing at all here, which is every company when
+    there is no model key (plan decision 3). `(country, window)` pairs are
+    de-duplicated, so two moves a day apart cost one query rather than two.
+
+    The moves are read back from the table rather than taken from this run's
+    detection, so a country edge that only appears now also picks up the
+    country-routed moves stored earlier. The upsert is idempotent on
+    `(date, country, news_source)`, so a re-run rewrites nothing.
+
+    A failing news source is swallowed exactly as it is in `enrich_move`: the
+    evidence behind a gate is worth a network call, never an ingest.
+    """
+    codes = {code for code, _ in country_codes(session, ticker)}
+    if not codes:
+        return
+
+    country_moves = session.exec(
+        select(Move)
+        .where(col(Move.ticker) == ticker)
+        .where(col(Move.sub_routing).startswith(_COUNTRY_SUB_ROUTING_PREFIX))
+    ).all()
+
+    windows: dict[tuple[str, date, date], None] = {}
+    for move in country_moves:
+        code = _country_of(move.sub_routing)
+        if code is None or code not in codes:
+            continue
+        start, end = window_for(move.date)
+        windows[(code, start, end)] = None
+
+    drafts: list[news_geo.GeoEventDraft] = []
+    for code, start, end in windows:
+        try:
+            drafts.extend(news_geo.fetch_geo_events(news_source, code, start, end, limit))
+        # A dead or rate-limited news source must not fail the ingest.
+        except Exception:
+            logger.warning(
+                "geo search failed for %s %s (%s to %s)", ticker, code, start, end, exc_info=True
+            )
+            continue
+
+    news_geo.upsert_geo_events(session, drafts)
 
 
 def _count(session: Session, statement: Any) -> int:
@@ -484,6 +832,18 @@ def ingest_ticker(
         # 1. Ontology: identity, sector ETF and peers, cached per company.
         company = get_or_build_company(session, key, model, refresh=refresh)
 
+        # 1b. Edges, built in two calls and deliberately so (v1.5 decision 4).
+        #     The first call is the model's answer — competitor / supplier /
+        #     customer / country — and it has to come first because the country
+        #     edges are what decide which country ETFs are worth fetching. Only
+        #     once those returns are in can the betas be fitted, so the `factor`
+        #     edges can only be written by a second call. `build_edges` is
+        #     replace-all per relation and the model's answer is cached inside
+        #     it for the run, so the second call rewrites the same four
+        #     relations to the same rows and adds the fifth; nothing
+        #     accumulates and nothing is duplicated.
+        build_edges(session, company, model, factor_betas=None)
+
         # 2. Inputs. The stock is required; the market and the sector ETF are
         #    the decomposition's regressors, and only the ETF is optional.
         stock = prices.fetch_ohlcv(key, run_period)
@@ -493,22 +853,57 @@ def ingest_ticker(
         peers = company.peers
         peer_returns = prices.fetch_peer_returns(peers, run_period) if peers else pd.DataFrame()
 
-        # 3. Features -> prices.
-        features = build_features(stock, market, etf, earnings)
+        # 2b. Factor proxies -> betas -> the `factor` edges. An empty frame is
+        #     the honest "no proxy resolved" answer (every symbol failed, or
+        #     `fetch_factor_returns` was handed nothing): the factor pass is
+        #     then skipped entirely, `factor_betas=None` leaves any previously
+        #     fitted edges alone, and `build_features` is called the v1 way.
+        factor_returns = prices.fetch_factor_returns(_factor_proxies(session, key), run_period)
+        has_factors = not factor_returns.empty
+        if has_factors:
+            betas = factor_betas(compute_returns(stock)["ret"], factor_returns)
+            build_edges(session, company, model, factor_betas=_latest_betas(betas))
+
+        # 3. Features -> prices. With factors, every row also carries the
+        #    `macro_driver` attribution (`moves.FACTOR_COLUMNS`).
+        features = build_features(
+            stock, market, etf, earnings, factors=factor_returns if has_factors else None
+        )
         _write_prices(session, key, features)
 
-        # 4. Detection -> moves.
+        # 4. Detection -> moves, and the two v1.5 co-movements beside the v1
+        #    one. `peer_comove` still averages `companies.peers_json`;
+        #    `rival_comove` averages the `competitor` edges and `chain_comove`
+        #    the `supplier` and `customer` edges, and those two are what
+        #    `sub_route` judges (decision 6).
         detected = detect_moves(features, run_z, run_pct)
+        dates = pd.DatetimeIndex(detected.index)
         comove = (
-            peer_comove(peer_returns, pd.DatetimeIndex(detected.index))
+            peer_comove(peer_returns, dates)
             if peers and not peer_returns.empty
             else pd.Series(index=detected.index, dtype=float)
         )
-        _write_moves(session, key, detected, comove)
+        rivals = relation_tickers(session, key, "competitor")
+        chain = _chain_tickers(session, key)
+        rival_returns = prices.fetch_peer_returns(rivals, run_period) if rivals else pd.DataFrame()
+        chain_returns = prices.fetch_peer_returns(chain, run_period) if chain else pd.DataFrame()
+        _write_moves(
+            session,
+            key,
+            detected,
+            comove,
+            signed_comove(rival_returns, dates),
+            signed_comove(chain_returns, dates),
+        )
+
+        # 4b. Geopolitical counts for the moves that came out `country:XX`.
+        _write_geo_events(session, key, news, settings.news_limit)
 
         # 5. Explain the biggest moves on record — not just this run's — so the
         #    top-N is stable as history accumulates. Everything else waits for
-        #    `enrich_move` on demand.
+        #    `enrich_move` on demand. The related returns are handed down so a
+        #    move that expands along its edges does not refetch them.
+        related_returns = _related_returns(rival_returns, chain_returns)
         top = session.exec(
             select(Move)
             .where(col(Move.ticker) == key)
@@ -525,6 +920,7 @@ def ingest_ticker(
                 refresh=refresh,
                 news_limit=settings.news_limit,
                 top_k=settings.top_k_articles,
+                related_returns=related_returns,
             )
 
         # 6. Counts read back from the tables, so they are totals and not a
@@ -551,6 +947,19 @@ def ingest_ticker(
             .join(Move, col(Move.id) == col(Explanation.move_id))
             .where(col(Move.ticker) == key),
         )
+        n_edges = _count(
+            session,
+            select(func.count()).select_from(CompanyEdge).where(col(CompanyEdge.src) == key),
+        )
+        codes = [code for code, _ in country_codes(session, key)]
+        n_geo_events = (
+            _count(
+                session,
+                select(func.count()).select_from(GeoEvent).where(col(GeoEvent.country).in_(codes)),
+            )
+            if codes
+            else 0
+        )
         provider_name = _stored_provider_name(session, key, model.name)
 
     return IngestResult(
@@ -563,4 +972,6 @@ def ingest_ticker(
         n_explanations=n_explanations,
         provider=provider_name,
         news_source=getattr(news, "name", "unknown"),
+        n_edges=n_edges,
+        n_geo_events=n_geo_events,
     )

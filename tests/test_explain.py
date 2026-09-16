@@ -13,8 +13,9 @@ No network and no API key: `HeuristicProvider` is the real provider under test.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -27,7 +28,15 @@ from stock_moves.explain import (
     get_or_create_explanation,
     top_scored,
 )
-from stock_moves.models import Article, Company, Explanation, Move, MoveArticle
+from stock_moves.models import (
+    Article,
+    Company,
+    CompanyEdge,
+    Explanation,
+    GeoEvent,
+    Move,
+    MoveArticle,
+)
 from stock_moves.providers.base import (
     ArticleInput,
     ArticleScore,
@@ -38,6 +47,7 @@ from stock_moves.providers.base import (
     ToolFn,
 )
 from stock_moves.providers.heuristic import HeuristicProvider
+from stock_moves.providers.prompts import EXPLAIN_SYSTEM, move_block, narrative_block
 
 MOVE_DATE = date(2025, 6, 3)
 
@@ -375,3 +385,222 @@ def test_unpersisted_move_is_rejected(session: Session, no_api_key: None) -> Non
 
     with pytest.raises(ValueError, match="move.id"):
         get_or_create_explanation(session, orphan, company, HeuristicProvider())
+
+
+# --------------------------------------------------------------------------- #
+# The relationship layer (v1.5 decisions 1 and 5)
+# --------------------------------------------------------------------------- #
+
+
+def seed_edges(session: Session) -> None:
+    """Edges for TEST, edges for someone else, and three country-days.
+
+    The rows that must *not* reach the context are seeded alongside the ones
+    that must: another company's competitor, a `factor` edge (which is not a
+    ticker), a country with no edge, and a geo event outside the move's window.
+    """
+    session.add_all(
+        [
+            CompanyEdge(src="TEST", dst="RIVAL", relation="competitor", weight=0.9, source="model"),
+            CompanyEdge(src="TEST", dst="SUPP", relation="supplier", weight=0.7, source="model"),
+            CompanyEdge(src="TEST", dst="CUST", relation="customer", weight=0.5, source="model"),
+            CompanyEdge(src="TEST", dst="TW", relation="country", weight=0.4, source="model"),
+            CompanyEdge(src="TEST", dst="CN", relation="country", weight=0.6, source="model"),
+            CompanyEdge(src="TEST", dst="oil", relation="factor", weight=0.8, source="prices"),
+            CompanyEdge(
+                src="OTHER", dst="ALIEN", relation="competitor", weight=1.0, source="model"
+            ),
+        ]
+    )
+    session.add_all(
+        [
+            GeoEvent(
+                date=MOVE_DATE,
+                country="TW",
+                headline_count=14,
+                sample_titles_json='["Taiwan hit by new export controls"]',
+                news_source="google_rss",
+            ),
+            GeoEvent(
+                date=MOVE_DATE - timedelta(days=9),
+                country="TW",
+                headline_count=3,
+                sample_titles_json="[]",
+                news_source="google_rss",
+            ),
+            GeoEvent(
+                date=MOVE_DATE,
+                country="JP",
+                headline_count=8,
+                sample_titles_json="[]",
+                news_source="google_rss",
+            ),
+        ]
+    )
+    session.commit()
+
+
+def test_build_context_without_a_session_is_the_v1_context(session: Session) -> None:
+    move, company, _, _ = seed(session)
+    seed_edges(session)
+
+    ctx = build_context(move, company)
+
+    assert ctx.peers == ("PEER",)
+    assert ctx.competitors == ()
+    assert ctx.suppliers == () and ctx.customers == ()
+    assert ctx.countries == () and ctx.geo_events == ()
+
+
+def test_build_context_with_a_session_fills_the_edges_and_events(session: Session) -> None:
+    move, company, _, _ = seed(session)
+    seed_edges(session)
+
+    ctx = build_context(move, company, session)
+
+    assert ctx.competitors == ("RIVAL",)
+    assert ctx.suppliers == ("SUPP",)
+    assert ctx.customers == ("CUST",)
+    # Largest weight first, which is the order the gate and the geo queries
+    # walk; the `factor` edge is not a ticker and belongs to none of the three.
+    assert ctx.countries == (("CN", 0.6), ("TW", 0.4))
+    assert "oil" not in ctx.competitors + ctx.suppliers + ctx.customers
+    assert "ALIEN" not in ctx.competitors
+    # One line, for the country this company has an edge to, inside the move's
+    # +/-1 day window.
+    assert ctx.geo_events == (
+        f"{MOVE_DATE:%Y-%m-%d} TW 14 headlines: Taiwan hit by new export controls",
+    )
+    # The v1 half is untouched.
+    assert ctx.peers == ("PEER",)
+    assert ctx.routing == "company"
+
+
+def test_a_session_with_no_edges_leaves_the_context_as_v1(session: Session) -> None:
+    """The keyless install: `suggest_relations` stores nothing, so the context
+    is v1-shaped even though a session was handed in."""
+    move, company, _, _ = seed(session)
+
+    ctx = build_context(move, company, session)
+
+    assert ctx.competitors == () and ctx.countries == () and ctx.geo_events == ()
+
+
+def test_get_or_create_explanation_hands_the_provider_the_edges(
+    session: Session, no_api_key: None
+) -> None:
+    move, company, _, _ = seed(session)
+    seed_edges(session)
+
+    class Capturing(BadProvider):
+        context: MoveContext | None = None
+
+        def explain(
+            self, move: MoveContext, scored: Sequence[tuple[ArticleInput, ArticleScore]]
+        ) -> ExplanationResult:
+            Capturing.context = move
+            return ExplanationResult("said", "company", 0.5, (), False)
+
+    get_or_create_explanation(session, move, company, Capturing())
+
+    assert Capturing.context is not None
+    assert Capturing.context.competitors == ("RIVAL",)
+    assert Capturing.context.geo_events != ()
+
+
+# --------------------------------------------------------------------------- #
+# The prompt block (v1.5 decision 9)
+# --------------------------------------------------------------------------- #
+
+
+def context_with(**overrides: Any) -> MoveContext:
+    base: dict[str, Any] = {
+        "ticker": "TEST",
+        "company_name": "Testco Industries Inc",
+        "date": MOVE_DATE,
+        "ret": -0.061,
+        "ret_z": -2.6,
+        "gap_ret": None,
+        "intraday_ret": None,
+        "vol_z": None,
+        "mkt_component": -0.002,
+        "sector_component": -0.004,
+        "idio_component": -0.055,
+        "routing": "company",
+        "direction": "down",
+        "regime_mkt": None,
+        "regime_sector": None,
+        "near_earnings": False,
+        "sector": "Technology",
+        "industry": "Semiconductors",
+        "peers": ("PEER",),
+        "peer_comove": 0.01,
+    }
+    base.update(overrides)
+    return MoveContext(**base)
+
+
+def test_move_block_drops_the_new_keys_when_there_is_nothing_to_say() -> None:
+    payload = json.loads(move_block(context_with()))
+
+    for key in (
+        "sub_routing",
+        "macro_driver",
+        "macro_driver_component",
+        "rival_comove",
+        "chain_comove",
+        "competitors",
+        "suppliers",
+        "customers",
+        "countries",
+        "geo_events",
+    ):
+        assert key not in payload
+    # The v1 block is unchanged by their absence.
+    assert payload["ticker"] == "TEST"
+    assert payload["peers"] == ["PEER"]
+
+
+def test_move_block_carries_the_new_keys_when_they_are_set() -> None:
+    payload = json.loads(
+        move_block(
+            context_with(
+                sub_routing="country:TW",
+                macro_driver="country:TW",
+                macro_driver_component=-0.0234567,
+                rival_comove=0.031,
+                chain_comove=-0.036,
+                competitors=("RIVAL",),
+                suppliers=("SUPP",),
+                customers=("CUST",),
+                countries=(("TW", 0.4),),
+                geo_events=("2025-06-03 TW 14 headlines: Taiwan hit",),
+            )
+        )
+    )
+
+    assert payload["sub_routing"] == "country:TW"
+    assert payload["macro_driver"] == "country:TW"
+    assert payload["macro_driver_component"] == pytest.approx(-0.02346, abs=1e-5)
+    assert payload["rival_comove"] == pytest.approx(0.031)
+    assert payload["chain_comove"] == pytest.approx(-0.036)
+    assert payload["competitors"] == ["RIVAL"]
+    assert payload["suppliers"] == ["SUPP"] and payload["customers"] == ["CUST"]
+    assert payload["countries"] == [{"country": "TW", "weight": 0.4}]
+    assert payload["geo_events"] == ["2025-06-03 TW 14 headlines: Taiwan hit"]
+
+
+def test_the_narrative_block_says_the_new_signals_too() -> None:
+    """The keyed prompt and the keyless summary are the same sentences."""
+    said = narrative_block(
+        context_with(sub_routing="share_shift", rival_comove=0.031, competitors=("RIVAL",))
+    )
+    assert "Share shift: RIVAL rose 3.1% the same day." in said
+
+
+def test_the_explain_prompt_tells_the_model_what_the_sub_buckets_mean() -> None:
+    assert "share_shift" in EXPLAIN_SYSTEM
+    assert "country:XX" in EXPLAIN_SYSTEM
+    assert "via <country> exposure" in EXPLAIN_SYSTEM
+    # The geo count is context, not an article: it may never be cited on its own.
+    assert "geo_events" in EXPLAIN_SYSTEM

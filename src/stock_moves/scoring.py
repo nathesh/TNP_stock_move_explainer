@@ -342,6 +342,8 @@ def score_and_link(
     articles: Sequence[Article],
     provider: ModelProvider,
     top_k: int = 15,
+    *,
+    context: MoveContext | None = None,
 ) -> list[MoveArticle]:
     """Score `articles` for `move` and rewrite its `move_articles` rows.
 
@@ -352,11 +354,19 @@ def score_and_link(
     `model_score`, so nothing is lost and model spend stays at one call per
     move. A headline whose `geo_gate` shut is capped at `GEO_CAP` on both
     paths, the model's mean included.
+
+    `context` is the v1.5 escape hatch for the gate rule. `MoveContext` knows
+    nothing of `company_edges` or `geo_events` — they are separate tables and
+    this module does not read them — so `from_objects` builds a context with no
+    countries, and :func:`geo_gate` then shuts on every geopolitical headline.
+    A caller that *has* read the edges (`ingest.enrich_move`) passes the fuller
+    context here and it is used verbatim. Nothing else about the scoring
+    changes: the same context feeds the heuristic, the model and the gate.
     """
     if move.id is None:
         raise ValueError("score_and_link needs a persisted move: move.id is None")
 
-    ctx = MoveContext.from_objects(move, company)
+    ctx = MoveContext.from_objects(move, company) if context is None else context
     # One row per article even if the caller passed a url twice: the link's
     # primary key is (move_id, article_id).
     unique: dict[int, Article] = {}

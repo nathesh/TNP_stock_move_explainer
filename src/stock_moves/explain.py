@@ -24,6 +24,7 @@ settings, so the whole module is testable against an in-memory database.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 from collections.abc import Sequence
@@ -31,6 +32,7 @@ from typing import Any
 
 from sqlmodel import Session, col, select
 
+from stock_moves import ontology
 from stock_moves.models import (
     Article,
     Company,
@@ -39,6 +41,8 @@ from stock_moves.models import (
     MoveArticle,
     utcnow,
 )
+from stock_moves.news.base import window_for
+from stock_moves.news.geo import geo_event_lines
 from stock_moves.providers.base import (
     ArticleInput,
     ArticleScore,
@@ -110,9 +114,36 @@ def top_scored(
     ]
 
 
-def build_context(move: Move, company: Company) -> MoveContext:
-    """The quantitative half of the prompt: decomposition, regime, event flags, peers."""
-    return MoveContext.from_objects(move, company)
+def build_context(move: Move, company: Company, session: Session | None = None) -> MoveContext:
+    """The quantitative half of the prompt: decomposition, regime, event flags, peers.
+
+    With a `session`, the v1.5 relationship layer is attached as well: the
+    company's typed edges and the geopolitical headline counts for the move's
+    own ±1 day window (v1.5 decisions 1 and 5). Both live in tables of their
+    own, so they are read here and replaced onto the context rather than being
+    read by `MoveContext.from_objects`, which knows no tables.
+
+    `session` is optional because `MoveContext.from_objects` is the contract
+    the provider layer is written against, and a caller that only has a move
+    and a company row -- a test, a chat renderer -- must still be able to build
+    one. Without it this returns exactly the v1 context, edge fields at their
+    defaults, which is also what a database with no stored edges yields.
+    """
+    context = MoveContext.from_objects(move, company)
+    if session is None:
+        return context
+
+    ticker = str(move.ticker or company.ticker or "")
+    countries = ontology.country_codes(session, ticker)
+    start, end = window_for(move.date)
+    return dataclasses.replace(
+        context,
+        competitors=tuple(ontology.relation_tickers(session, ticker, "competitor")),
+        suppliers=tuple(ontology.relation_tickers(session, ticker, "supplier")),
+        customers=tuple(ontology.relation_tickers(session, ticker, "customer")),
+        countries=tuple(countries),
+        geo_events=tuple(geo_event_lines(session, [code for code, _ in countries], start, end)),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -182,7 +213,7 @@ def get_or_create_explanation(
         return existing
 
     scored = top_scored(session, move.id, top_k=top_k)
-    result = provider.explain(build_context(move, company), scored)
+    result = provider.explain(build_context(move, company, session), scored)
 
     category = _category(result.primary_category)
     values: dict[str, Any] = {
