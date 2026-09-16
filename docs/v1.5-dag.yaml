@@ -1,0 +1,442 @@
+# v1.5 task DAG for stock-move-explainer. Human twin: docs/v1.5-plan.md.
+# Each `prompt` is handed to one coding agent verbatim, prefixed by common_preamble.
+# Wave 0 is human work and has no agent: tag v1-submitted, branch v1.5, prove the key with
+# one live call, confirm the three eval dates in docs/v1.5-plan.md against ingested prices.
+common_preamble: |
+  You are implementing one task of the v1.5 extension of a submitted Python take-home. Repo: <repo root>
+  (package src/stock_moves, Python 3.12, uv, pytest, ruff). First read DESIGN.md completely, then
+  docs/v1.5-plan.md completely; DESIGN.md is the source of truth for v1 and docs/v1.5-plan.md for v1.5,
+  and you must not change either. Then do the task below.
+  Rules: touch only the files listed under OWNS; add no dependencies; type-hint everything; never call the
+  network inside pytest; keep every v1 test passing; if an upstream module is not there yet, code against
+  the signature given here and make your tests exercise your own code. Existing public names keep their
+  signatures unless the task says otherwise. Before reporting run from the repo root:
+  uv run ruff check . && uv run ruff format . && uv run pytest -q
+  Report: absolute paths of files created/edited, public names exposed, the test result, any deviation.
+
+tasks:
+  # ---------------------------------------------------------------- wave 1: fixes
+  - id: F1
+    title: Live model smoke script
+    wave: 1
+    depends_on: []
+    critical_path: false
+    estimate_min: 15
+    owns:
+      - scripts/smoke_model.py
+    prompt: |
+      Write scripts/smoke_model.py: a script (not a test) that loads Settings via
+      stock_moves.settings.get_settings(), builds AnthropicProvider from
+      stock_moves.providers.anthropic with the configured key and model, and makes ONE
+      cheap live call: provider.suggest_peers("AAPL", "Apple Inc.", "Technology",
+      "Consumer Electronics") or whatever the current suggest_peers signature is (read
+      providers/anthropic.py). Print the model name, the elapsed ms, and the parsed result.
+      On any exception print the exception class, its message, and the HTTP status if the
+      anthropic SDK exposes one, then exit 1. No key present: print "no key" and exit 2.
+      This script exists because v1 shipped with the model path unproven; it must be the
+      first thing run on any machine. Add a two-line docstring saying so. No tests.
+
+  - id: F2
+    title: Default period 2y so regimes fill the window
+    wave: 1
+    depends_on: []
+    critical_path: false
+    estimate_min: 20
+    owns:
+      - src/stock_moves/settings.py
+      - tests/test_moves.py
+    prompt: |
+      Change Settings.default_period from "1y" to "2y" in src/stock_moves/settings.py.
+      In tests/test_moves.py add one test that builds features from a synthetic 2-year
+      series (tests/synth.py has synthetic_ohlcv / synthetic_market; read them) and asserts
+      regime_mkt is non-null on every row after the 200-day warm-up and null before it.
+      Do not change moves.py. Note in your report that data/snapshot.db.gz must be rebuilt
+      after this change (task R12 does it).
+
+  - id: F3
+    title: Heuristic confidence requires an event verb
+    wave: 2
+    depends_on: []
+    critical_path: false
+    estimate_min: 30
+    owns:
+      - src/stock_moves/providers/heuristic.py
+      - tests/test_heuristic_provider.py
+    prompt: |
+      Read HeuristicProvider.explain and the existing EVENT_TERMS, _names_an_event,
+      WEAK_ATTRIBUTION_PENALTY and WEAK_ATTRIBUTION_FLOOR in providers/heuristic.py. Some of
+      this fix may already exist; verify before writing. Required behaviour after your
+      change: (a) confidence is capped at 0.45 when no cited headline contains an event
+      term; (b) when at least one does, the cap is 0.85 and entity-only matches add nothing
+      above the article's stored relevance; (c) the explanation text names which cited
+      headline carried the event. Add tests: an entity-only headline set yields confidence
+      <= 0.45; the same set plus one headline containing "cuts guidance" yields > 0.45 and
+      cites that article id. The 2026-01-20 AAPL case in docs/WRITEUP.md is the motivating
+      defect: generic bullish commentary got 0.85.
+
+  # ---------------------------------------------------------------- wave 1: relationship layer
+  - id: R1
+    title: New tables and columns
+    wave: 1
+    depends_on: []
+    critical_path: true
+    estimate_min: 30
+    owns:
+      - src/stock_moves/models.py
+      - tests/test_models.py
+    prompt: |
+      Add to src/stock_moves/models.py, following the existing style (DateT alias, utcnow):
+      1. class CompanyEdge(SQLModel, table=True), __tablename__ "company_edges":
+         src: str (pk, index), dst: str (pk), relation: str (pk), weight: float = 1.0,
+         source: str, updated_at: datetime. relation values are documented in a module
+         constant EDGE_RELATIONS: tuple = ("competitor", "supplier", "customer", "country",
+         "factor"); EDGE_SOURCES = ("model", "etf_holdings", "prices").
+      2. class GeoEvent(SQLModel, table=True), __tablename__ "geo_events":
+         id pk, date: DateT (index), country: str (index, ISO-3166 alpha-2), headline_count:
+         int, sample_titles_json: str = "[]", news_source: str, fetched_at: datetime.
+         Unique on (date, country, news_source).
+      3. On Price AND Move add: macro_driver: str | None = None,
+         macro_driver_component: float | None = None.
+      4. On Move add: sub_routing: str | None = None, rival_comove: float | None = None,
+         chain_comove: float | None = None.
+      5. On MoveArticle add: geo_gate: float | None = None.
+      Keep every existing column. SQLite has no migrations here: the DB is created fresh by
+      create_all, so document in the module docstring that an existing data/app.db from v1
+      must be deleted or re-ingested with ?refresh=true. Tests: tables create, an edge
+      round-trips, the unique constraint on geo_events raises on a duplicate, Move accepts
+      the new fields with defaults.
+
+  - id: R2
+    title: Factor proxies and macro_driver attribution
+    wave: 1
+    depends_on: []
+    critical_path: true
+    estimate_min: 45
+    owns:
+      - src/stock_moves/prices.py
+      - src/stock_moves/moves.py
+      - tests/test_prices.py
+      - tests/test_moves_factors.py
+    prompt: |
+      Decision 4 of docs/v1.5-plan.md. In prices.py add FACTOR_ETFS: dict[str, str] =
+      {"oil": "USO", "dollar": "UUP", "rates": "TLT", "gold": "GLD"} and COUNTRY_ETFS:
+      dict[str, str] = {"TW": "EWT", "CN": "FXI", "JP": "EWJ", "KR": "EWY", "IN": "INDA",
+      "EU": "VGK", "MX": "EWW", "CA": "EWC", "GB": "EWU", "DE": "EWG"}, and
+      fetch_factor_returns(names: Mapping[str, str], period: str = "2y") -> pd.DataFrame
+      (one close-to-close return column per key, date index; reuse fetch_ohlcv /
+      compute_returns; a failed symbol is dropped with a warning, never raised).
+      In moves.py add two pure functions:
+        factor_betas(ret: pd.Series, factors: pd.DataFrame, window: int = 60) -> pd.DataFrame
+          trailing univariate OLS beta of ret on each factor column, fitted on the window
+          ending at t-1 (same convention as decompose), one column per factor.
+        macro_driver(ret: pd.Series, factors: pd.DataFrame, betas: pd.DataFrame,
+                     z_window: int = 20, z_min: float = 1.5) -> pd.DataFrame
+          columns macro_driver (str|None) and macro_driver_component (float|None): per day,
+          contribution_f = beta_f[t] * factor_ret_f[t]; eligible factors are those with
+          abs(rolling_z(factor_ret_f)[t]) >= z_min; driver = argmax abs(contribution) over
+          eligible, None if none eligible. Country factor keys are "country:XX".
+      Extend build_features with a keyword-only parameter factors: pd.DataFrame | None =
+      None; when given, the two new columns are appended to the output and to
+      FEATURE_COLUMNS handling (read how FEATURE_COLUMNS is consumed and keep v1 callers
+      working when factors is None: the columns exist and are None). Do NOT change
+      decompose or route; routing is still SPY + sector.
+      Tests, no network: synthetic factor series where one factor has an injected 4-sigma
+      day and the stock has beta 1 to it -> driver is that factor on that day, None on a
+      quiet day; a factor that never exceeds z_min is never chosen even with a large beta.
+
+  - id: R3
+    title: Provider suggest_relations and the wider MoveContext
+    wave: 1
+    depends_on: []
+    critical_path: true
+    estimate_min: 45
+    owns:
+      - src/stock_moves/providers/base.py
+      - src/stock_moves/providers/anthropic.py
+      - src/stock_moves/providers/heuristic.py
+      - tests/test_anthropic_provider.py
+      - tests/test_relations_provider.py
+    prompt: |
+      In providers/heuristic.py add suggest_relations only; F3 edits explain() in the next
+      wave, so touch nothing else in that file.
+      Decision 3 of docs/v1.5-plan.md. In providers/base.py add
+        @dataclass(frozen=True) class Relations: competitors: tuple[str, ...];
+          suppliers: tuple[str, ...]; customers: tuple[str, ...];
+          countries: tuple[tuple[str, float], ...]   # (ISO alpha-2, weight 0-1, sum <= 1)
+      and to the ModelProvider protocol
+        def suggest_relations(self, ticker: str, name: str, sector: str | None,
+                              industry: str | None) -> Relations
+      Extend MoveContext with defaulted fields at the END (dataclass ordering):
+        sub_routing: str | None = None, macro_driver: str | None = None,
+        macro_driver_component: float | None = None, rival_comove: float | None = None,
+        chain_comove: float | None = None, competitors: tuple[str, ...] = (),
+        suppliers: tuple[str, ...] = (), customers: tuple[str, ...] = (),
+        countries: tuple[tuple[str, float], ...] = (),
+        geo_events: tuple[str, ...] = ()   # rendered lines "2025-04-03 CN 14 headlines: <title>"
+      and make from_objects read the new Move columns when present (getattr with default).
+      HeuristicProvider.suggest_relations returns Relations(competitors=(), suppliers=(),
+      customers=(), countries=()) — the ETF fallback is applied by ontology, not here — and
+      the docstring says the geo gate cannot open without a key.
+      AnthropicProvider.suggest_relations: one call, structured output via a pydantic model
+      (follow the _Peers pattern), system prompt asks for up to 6 direct competitors as
+      tickers, up to 4 suppliers and 4 customers as tickers (public only, else omit), and
+      up to 5 countries as ISO alpha-2 with revenue-or-supply weights summing to at most 1.
+      Any failure returns the empty Relations and logs, matching how suggest_peers degrades.
+      Also add TOOL_SPECS entry get_relations(ticker) -> {edges: [{dst, relation, weight,
+      source}]} for the chat loop; the callable is wired in R11.
+      Tests with the existing fake client pattern: the parse, the clamp on weights, the
+      degrade path.
+
+  - id: R5
+    title: Geopolitical headline counts per country
+    wave: 1
+    depends_on: []
+    critical_path: false
+    estimate_min: 35
+    owns:
+      - src/stock_moves/news/geo.py
+      - tests/test_geo.py
+    prompt: |
+      Decision 5 of docs/v1.5-plan.md. Create src/stock_moves/news/geo.py:
+        COUNTRY_NAMES: dict[str, str]  ISO alpha-2 -> query name, at least the ten in
+          prices.COUNTRY_ETFS plus "US", "RU", "IL", "IR", "SA", "UA".
+        GEO_TERMS: tuple[str, ...] = ("tariff", "tariffs", "sanctions", "export controls",
+          "export ban", "embargo", "conflict", "war", "blockade", "trade dispute")
+        geo_query(country: str) -> str   '"<name>" (tariff OR tariffs OR sanctions OR ...)'
+          anchored with "stock market" like news/base.build_query does.
+        is_geo_headline(title: str) -> bool   any GEO_TERMS word-boundary match.
+        countries_in(title: str, codes: Iterable[str]) -> list[str]   codes whose
+          COUNTRY_NAMES value appears in the title (case-insensitive, word boundary).
+        fetch_geo_events(source: NewsSource, country: str, start: date, end: date,
+                         limit: int = 50) -> list[GeoEventDraft]
+          where GeoEventDraft is a frozen dataclass (date, country, headline_count,
+          sample_titles: tuple[str, ...] (max 5), news_source); one draft per day in
+          [start, end] that has at least one item, grouped by item.published_at date.
+        upsert_geo_events(session, drafts) -> int   idempotent on (date, country, news_source).
+      GeoEvent comes from R1; code against: GeoEvent(date, country, headline_count,
+      sample_titles_json, news_source, fetched_at). Tests: a fake NewsSource returning
+      dated NewsItems -> correct grouping and counts; is_geo_headline and countries_in on
+      a handful of titles; upsert twice yields one row.
+
+  # ---------------------------------------------------------------- wave 2
+  - id: R4
+    title: Build and store company edges
+    wave: 2
+    depends_on: [R1, R3]
+    critical_path: true
+    estimate_min: 40
+    owns:
+      - src/stock_moves/ontology.py
+      - tests/test_ontology.py
+    prompt: |
+      Decisions 1-3 of docs/v1.5-plan.md. In ontology.py add:
+        build_edges(session, company: Company, provider: ModelProvider,
+                    factor_betas: Mapping[str, float] | None = None) -> list[CompanyEdge]
+          One provider.suggest_relations call. competitor edges from its competitors
+          (source "model"); when that list is empty, competitor edges from peers_of(company)
+          (source "etf_holdings"). supplier/customer/country edges from the call (source
+          "model"; country weight = the given weight). factor edges from factor_betas
+          (dst = factor name, weight = beta, source "prices") when given.
+          Replace-all semantics per (src, relation): delete the company's existing rows of
+          each relation you are writing, then insert. Idempotent.
+        edges_of(session, ticker: str, relation: str | None = None) -> list[CompanyEdge]
+        relation_tickers(session, ticker: str, relation: str) -> list[str]
+        country_codes(session, ticker: str) -> list[tuple[str, float]]
+      Keep get_or_build_company, upsert_company, peers_of working unchanged; do not
+      change the companies table. Tests: model path writes typed edges; empty model path
+      writes ETF competitors; second build replaces rather than duplicates; edges_of filters.
+
+  - id: R6
+    title: sub_routing from rival, chain and driver signals
+    wave: 2
+    depends_on: [R2]
+    critical_path: true
+    estimate_min: 35
+    owns:
+      - src/stock_moves/moves.py
+      - tests/test_moves_subrouting.py
+    prompt: |
+      Decision 6 of docs/v1.5-plan.md. R2 has already edited moves.py; read it and add:
+        SHARE_SHIFT_RATIO = 0.25; SUPPLY_CHAIN_RATIO = 0.5; MIN_RIVALS = 2
+        signed_comove(other_returns: pd.DataFrame, dates: pd.DatetimeIndex) -> pd.Series
+          mean same-day return across columns (NaN when fewer than MIN_RIVALS have data).
+          peer_comove already exists; read it and share code where it is identical.
+        sub_route(routing: str, ret: float, rival_comove: float | None,
+                  chain_comove: float | None, macro_driver: str | None) -> str | None
+          pure, per move: "share_shift" when routing == "company" and rival_comove is not
+          None and rival_comove * sign(ret) <= -SHARE_SHIFT_RATIO * abs(ret);
+          "supply_chain" when routing == "company" and chain_comove is not None and
+          chain_comove * sign(ret) >= SUPPLY_CHAIN_RATIO * abs(ret); the driver string
+          when routing == "macro" and macro_driver is not None; else None. share_shift wins
+          over supply_chain if both hold.
+      Do not change route(), decompose(), detect_moves(). Tests: every branch of sub_route,
+      the NaN rule of signed_comove, and a synthetic case where two rivals rise while the
+      stock falls 5 percent -> share_shift.
+
+  - id: R7
+    title: Query expansion along edges
+    wave: 2
+    depends_on: [R5]
+    critical_path: false
+    estimate_min: 30
+    owns:
+      - src/stock_moves/news/base.py
+      - tests/test_news.py
+    prompt: |
+      Decision 8 of docs/v1.5-plan.md. Extend queries_for_move with keyword-only params
+      sub_routing: str | None = None, rival_names: Sequence[str] = (),
+      chain_names: Sequence[str] = (), country: str | None = None. Behaviour: the v1
+      queries are unchanged and come first; then, when sub_routing == "share_shift", one
+      ("company", '"<rival name>" stock') per rival_names; when "supply_chain", one per
+      chain_names; when it starts with "country:", one ("macro", geo.geo_query(country))
+      using news/geo.py from R5 (import at module level; code against geo_query(country:
+      str) -> str). Never more than MAX_EXTRA_QUERIES = 3 extra queries; dedupe against the
+      v1 queries. Names go through clean_company_name. Tests: each branch, the cap, the
+      dedupe, and that a call with no new kwargs returns exactly the v1 list.
+
+  - id: R8
+    title: The geo gate in scoring
+    wave: 2
+    depends_on: [R1, R3, R5]
+    critical_path: true
+    estimate_min: 40
+    owns:
+      - src/stock_moves/scoring.py
+      - tests/test_scoring.py
+    prompt: |
+      Decision 7 of docs/v1.5-plan.md. In scoring.py:
+        GEO_CAP = 0.30
+        geo_gate(title: str, move: MoveContext) -> float | None
+          None when not geo.is_geo_headline(title). Else 1.0 when BOTH: some code in
+          geo.countries_in(title, [c for c, _ in move.countries]) is non-empty, AND
+          move.macro_driver is "country:<that code>" or in ("oil", "dollar"). Else 0.0.
+      heuristic_components gains the "geo_gate" component (float|None) and
+      heuristic_relevance applies min(relevance, GEO_CAP) when geo_gate == 0.0; 1.0 and
+      None leave relevance unchanged. score_and_link stores geo_gate on MoveArticle (R1
+      column) and, for articles a non-heuristic provider re-scores, applies the same cap to
+      the final mean so the model cannot lift a gated headline above GEO_CAP. Read how
+      heuristic_components takes its move argument today (it may take a Move or a
+      MoveContext) and keep that interface. Tests: a Taiwan tariff headline on a move with
+      a TW country edge and driver "country:TW" -> gate 1.0 and no cap; same headline with
+      driver None -> 0.0 and relevance <= 0.30; a non-geo headline -> None; a geo
+      headline naming a country the company has no edge to -> 0.0.
+
+  # ---------------------------------------------------------------- wave 3
+  - id: R9
+    title: Ingest wiring
+    wave: 3
+    depends_on: [F2, R1, R2, R4, R5, R6, R7, R8]
+    critical_path: true
+    estimate_min: 60
+    owns:
+      - src/stock_moves/ingest.py
+      - tests/test_ingest.py
+    prompt: |
+      Wire v1.5 into ingest_ticker without changing its signature. New sequence inside the
+      existing lock, after the v1 price fetch:
+        1. prices.fetch_factor_returns for FACTOR_ETFS plus the country ETFs of the
+           company's country edges (edges may not exist yet on first run: build the company
+           row and edges BEFORE fetching factors; country edges come from
+           ontology.build_edges with factor_betas=None, then a second build_edges call
+           after betas exist writes only the factor relation — or restructure so one call
+           suffices; your choice, document it).
+        2. build_features(..., factors=...) so prices carry macro_driver columns.
+        3. For detected moves: rival_comove from moves.signed_comove over
+           relation_tickers("competitor"), chain_comove over suppliers + customers (both via
+           prices.fetch_peer_returns, which already exists), sub_routing via
+           moves.sub_route. Store all of it on Move (_move_columns).
+        4. Geo events: for each move whose sub_routing starts with "country:", and for each
+           country edge, fetch_geo_events over the move window and upsert; the rendered
+           lines go into MoveContext.geo_events for scoring and explanation.
+        5. News: queries_for_move with the new kwargs; rival_names are the competitors whose
+           same-day return had the opposite sign; chain_names those with the same sign.
+        6. Scoring and explanation as v1, with the wider MoveContext.
+      Add the new float/str features to _FLOAT_FEATURES / _STR_FEATURES so _price_columns
+      and _move_columns carry them. Keep the freshness rule, locks and idempotency. Tests
+      with the existing monkeypatch pattern (no network): one synthetic run stores
+      sub_routing and macro_driver, writes competitor edges, and a second run does not
+      duplicate edges or geo events. Update IngestResult with counts: edges, geo_events.
+
+  - id: R10
+    title: Explanation prose for the new signals
+    wave: 3
+    depends_on: [R3, F3]
+    critical_path: true
+    estimate_min: 40
+    owns:
+      - src/stock_moves/explain.py
+      - src/stock_moves/providers/anthropic.py
+      - src/stock_moves/providers/heuristic.py
+      - tests/test_explain.py
+    prompt: |
+      Decision 9 of docs/v1.5-plan.md. explain.build_context fills the new MoveContext
+      fields from the Move row and the edge tables (ontology.relation_tickers,
+      ontology.country_codes, and the move-window geo_events rows rendered as
+      "YYYY-MM-DD CC N headlines: <first sample title>"). AnthropicProvider._move_block
+      renders sub_routing, macro_driver with its component, rival_comove, chain_comove,
+      competitors/suppliers/customers/countries, and the geo_events lines; _EXPLAIN_SYSTEM
+      gains two sentences: when sub_routing is share_shift name the rival and the direction;
+      when it is country:XX say "geopolitical, via <country> exposure" and cite the geo
+      event only if a cited article supports it. HeuristicProvider.explain (F3 has edited
+      it; read it) gains the same two template sentences, e.g. "Macro, geopolitical, via
+      Taiwan exposure: the Taiwan ETF moved N.N% and 14 tariff headlines named Taiwan." and
+      "Share shift: AMD rose 3.1% the same day." Tests: the two templates render with the
+      right numbers; a context with no new signals renders exactly the v1 sentence.
+
+  # ---------------------------------------------------------------- wave 4
+  - id: R11
+    title: API, queries and chat expose the new fields
+    wave: 4
+    depends_on: [R9, R10]
+    critical_path: true
+    estimate_min: 40
+    owns:
+      - src/stock_moves/queries.py
+      - src/stock_moves/api/schemas.py
+      - src/stock_moves/api/tickers.py
+      - src/stock_moves/api/chat.py
+      - tests/test_api.py
+      - tests/test_queries.py
+      - tests/test_chat.py
+    prompt: |
+      Decision 10 of docs/v1.5-plan.md. move_to_dict adds sub_routing, macro_driver,
+      macro_driver_component, rival_comove, chain_comove (rounded like the others).
+      New GET /tickers/{ticker}/relations -> {ticker, edges: [{dst, relation, weight,
+      source}]} using ontology.edges_of; 404 via _require_company. MoveFilters gains
+      sub_routing: str | None and list_moves filters on it; expose it as a query param on
+      GET /tickers/{ticker}. Chat: make_tools adds "get_relations" backed by
+      ontology.edges_of, matching the TOOL_SPECS entry R3 added. Static page: no change.
+      Tests: the new endpoint, the new filter, the new tool through the existing fake
+      provider pattern, and that every v1 response shape is a superset of what it was.
+
+  - id: R12
+    title: Eval script, snapshot rebuild, README and write-up addendum
+    wave: 4
+    depends_on: [R9, R10]
+    critical_path: false
+    estimate_min: 45
+    owns:
+      - scripts/eval_v15.py
+      - scripts/build_snapshot.py
+      - README.md
+      - docs/WRITEUP.md
+    prompt: |
+      1. scripts/eval_v15.py: a script, not a test, that takes the eval table from
+         docs/v1.5-plan.md as a module constant, runs ingest_ticker(period="2y") for each
+         ticker once, then prints for each (ticker, date): ret, ret_z, routing, sub_routing,
+         macro_driver, rival_comove, the explanation summary and its citations, and PASS or
+         FAIL against the expected sub_routing (accept any value listed with "or"). Exit 1
+         on any FAIL. Print a final line saying whether the run used a key.
+      2. Read scripts/build_snapshot.py; make sure it still works with the new tables and
+         2y default, and add a note at the top that it must be rerun after v1.5. Do not run
+         it inside pytest.
+      3. README: a "v1.5: the relationship layer" section in the same voice as the existing
+         README: the four-sentence summary from docs/v1.5-plan.md, the new endpoint, the
+         new move fields, the gate rule in one sentence, the "no key means no country edges,
+         so the geo gate stays closed" caveat, and the eval script.
+      4. docs/WRITEUP.md: append a short "v1.5 addendum" under the known limitations: what
+         was added, the three fixes, the eval result you can honestly report (leave the
+         numbers as TODO placeholders for the human to fill after a live run), and the two
+         new limitations: factor attribution is univariate per proxy, and geo events are
+         headline counts rather than a structured event feed.
+      Do not change any source file.
